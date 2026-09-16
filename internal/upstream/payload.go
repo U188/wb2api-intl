@@ -26,6 +26,15 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 		return src
 	}
 	obj["stream"] = true
+	// OpenAI 新字段翻译成 WorkBuddy 上游识别的旧字段；显式 max_tokens 优先。
+	translateMaxCompletionTokens(obj)
+	// 官方流式请求缺省要求 usage 末帧。显式合法对象保持原样；非法类型重建，
+	// 避免 null/字符串等值触发上游参数校验失败。
+	if opt, has := obj["stream_options"]; !has {
+		obj["stream_options"] = map[string]any{"include_usage": true}
+	} else if _, ok := opt.(map[string]any); !ok {
+		obj["stream_options"] = map[string]any{"include_usage": true}
+	}
 	normalizeToolChoice(obj)
 	normalizeRoles(obj)
 	// DeepSeek 思维链开关（见 thinking.go）：注入 thinking.type=enabled + 缺档补默认档。
@@ -46,6 +55,23 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 		return src
 	}
 	return out
+}
+
+// translateMaxCompletionTokens 把 OpenAI 新别名 max_completion_tokens 翻译为上游
+// 识别的 max_tokens。显式 max_tokens 优先；无效、非整数、非正数别名只删除不搬运。
+func translateMaxCompletionTokens(obj map[string]any) {
+	alias, has := obj["max_completion_tokens"]
+	delete(obj, "max_completion_tokens")
+	if !has {
+		return
+	}
+	if _, explicit := obj["max_tokens"]; explicit {
+		return
+	}
+	v, ok := alias.(float64) // JSON 数值默认解码为 float64
+	if ok && v > 0 && v == float64(int64(v)) {
+		obj["max_tokens"] = int64(v)
+	}
 }
 
 // effortRank 档位从低到高。
