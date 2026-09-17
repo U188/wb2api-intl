@@ -68,7 +68,8 @@ func TestSaveAtomicRoundtrip(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "workbuddy-u1.json")
 	a := &Auth{AccessToken: "at", RefreshToken: "rt", ExpiresAt: 1753600000,
-		UID: "u1", EnterpriseID: "e1", Nickname: "n1", FilePath: fp}
+		UID: "u1", EnterpriseID: "e1", Nickname: "n1", FilePath: fp,
+		Site: SiteIntl, DeviceToken: "device-1"}
 	if err := a.SaveAtomic(); err != nil {
 		t.Fatalf("save: %v", err)
 	}
@@ -83,7 +84,8 @@ func TestSaveAtomicRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reparse: %v", err)
 	}
-	if b.AccessToken != "at" || b.UID != "u1" || b.EnterpriseID != "e1" {
+	if b.AccessToken != "at" || b.UID != "u1" || b.EnterpriseID != "e1" ||
+		b.Site != SiteIntl || b.DeviceToken != "device-1" {
 		t.Errorf("roundtrip: %+v", b)
 	}
 }
@@ -121,5 +123,33 @@ func TestNeedsRefresh(t *testing.T) {
 	a.ExpiresAt = 9999999999
 	if a.NeedsRefresh(0) {
 		t.Error("far future should not need refresh")
+	}
+}
+
+func TestSnapshotReturnsConsistentCopy(t *testing.T) {
+	a := &Auth{
+		AccessToken: "at", RefreshToken: "rt", ExpiresAt: 123, Domain: "d",
+		UID: "u", EnterpriseID: "e", Nickname: "n", Site: "GLOBAL",
+		FilePath: "auth.json", DeviceToken: "dt",
+	}
+	s := a.Snapshot()
+	if s.AccessToken != "at" || s.RefreshToken != "rt" || s.ExpiresAt != 123 ||
+		s.Domain != "d" || s.UID != "u" || s.EnterpriseID != "e" ||
+		s.Nickname != "n" || s.Site != SiteIntl || s.FilePath != "auth.json" || s.DeviceToken != "dt" {
+		t.Fatalf("snapshot mismatch: %+v", s)
+	}
+	// 快照必须独立于后续字段更新。
+	a.Lock()
+	a.AccessToken = "new"
+	a.Unlock()
+	if s.AccessToken != "at" {
+		t.Fatalf("snapshot mutated with auth: %+v", s)
+	}
+}
+
+func TestNilSnapshot(t *testing.T) {
+	var a *Auth
+	if got := a.Snapshot(); got != (Snapshot{}) {
+		t.Fatalf("nil snapshot=%+v", got)
 	}
 }

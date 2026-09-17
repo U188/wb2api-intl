@@ -25,8 +25,9 @@ const (
 // originRefererFor 返回该账号所属站点的 Origin/Referer 根：
 // 国内版 web 域 codebuddy.cn；国际版 codebuddy.ai（与出站 base URL 同域）。
 // a 为 nil / 未知 site 时回落国内版（向后兼容）。
+// 注意：仅供兼容旧调用；请求主路径优先使用同一 Snapshot 的 commonHeadersSnapshot。
 func originRefererFor(a *auth.Auth) string {
-	if a != nil && a.Site == auth.SiteIntl {
+	if a != nil && auth.SiteFrom(a.Snapshot().Site) == auth.SiteIntl {
 		return originRefererIntl
 	}
 	return originRefererCN
@@ -89,57 +90,76 @@ func (c *Client) resolveDeviceToken(a *auth.Auth) string {
 	return ""
 }
 
-// injectDeviceToken 在 req 注入 X-Device-Token 头（仅当取到非空 token）。
-func (c *Client) injectDeviceToken(req *http.Request, a *auth.Auth) {
-	if tok := c.resolveDeviceToken(a); tok != "" {
+// resolveDeviceTokenSnapshot 解析本次请求的设备 token，账号快照优先于全局配置与文件。
+func (c *Client) resolveDeviceTokenSnapshot(s auth.Snapshot) string {
+	if s.DeviceToken != "" {
+		return s.DeviceToken
+	}
+	if c != nil && c.DeviceToken != "" {
+		return c.DeviceToken
+	}
+	if c != nil && c.DeviceTokenFile != "" {
+		return readDeviceTokenFile(c.DeviceTokenFile)
+	}
+	return ""
+}
+
+func (c *Client) injectDeviceTokenSnapshot(req *http.Request, s auth.Snapshot) {
+	if tok := c.resolveDeviceTokenSnapshot(s); tok != "" {
 		req.Header.Set("X-Device-Token", tok)
 	}
 }
 
-// CommonHeaders 设置所有 API 共享的请求头。
+// CommonHeaders 设置所有 API 共享的请求头。每次调用只取一次 Auth Snapshot，保证
+// token refresh 并发时各字段来自同一版本。
 func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
+	c.commonHeadersSnapshot(req, a.Snapshot())
+}
+
+func (c *Client) commonHeadersSnapshot(req *http.Request, s auth.Snapshot) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	origin := originRefererFor(a)
+	origin := originRefererCN
+	if auth.SiteFrom(s.Site) == auth.SiteIntl {
+		origin = originRefererIntl
+	}
 	req.Header.Set("Origin", origin)
 	req.Header.Set("Referer", origin+"/")
 	req.Header.Set("User-Agent", c.userAgent())
 }
 
-// ChatHeaders 在 common 之上加 chat 专属的账号头。
-// 缺省字段用 X-No-* 约定（与 CodeBuddy 官方 CLI 一致）。
-// clientIP 为本次请求的客户端 IP（按参数传递，不读共享字段——避免并发串扰）；
-// PassthroughIP=false 或 clientIP 为空时不注入 IP 头。
-func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string) {
-	c.CommonHeaders(req, a)
-	if a.AccessToken != "" {
-		req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+func (c *Client) chatHeadersSnapshot(req *http.Request, s auth.Snapshot, clientIP string) {
+	c.commonHeadersSnapshot(req, s)
+	if s.AccessToken != "" {
+		req.Header.Set("Authorization", "Bearer "+s.AccessToken)
 	} else {
 		req.Header.Set("X-No-Authorization", "1")
 	}
-	if a.UID != "" {
-		req.Header.Set("X-User-Id", a.UID)
+	if s.UID != "" {
+		req.Header.Set("X-User-Id", s.UID)
 	} else {
 		req.Header.Set("X-No-User-Id", "1")
 	}
-	if a.EnterpriseID != "" {
-		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
+	if s.EnterpriseID != "" {
+		req.Header.Set("X-Enterprise-Id", s.EnterpriseID)
 	} else {
 		req.Header.Set("X-No-Enterprise-Id", "1")
 	}
-	// 安全红线：绝不在 chat 请求里携带 X-Refresh-Token。
-	if a.Domain != "" {
-		req.Header.Set("X-Domain", a.Domain)
+	if s.Domain != "" {
+		req.Header.Set("X-Domain", s.Domain)
 	} else {
 		req.Header.Set("X-No-Department-Info", "1")
 	}
-	// 用量归属头：ClientName 非空则四头跟随（对齐官方桌面端），空则保持 X-Product="SaaS"。
 	c.injectAttribution(req)
-	// 客户端 IP 透传（仅 PassthroughIP=true 且本次请求带 IP）。
 	c.injectClientIP(req, clientIP)
-	// 设备风控头：auth 每号 > config 全局 > 文件兜底；空则不注入。
-	c.injectDeviceToken(req, a)
+	c.injectDeviceTokenSnapshot(req, s)
+}
+
+// ChatHeaders 在 common 之上加 chat 专属账号头。凭证字段来自一次 Snapshot，
+// 防止 refresh 并发更新时拼出新 token + 旧 domain 的混合请求。
+func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string) {
+	c.chatHeadersSnapshot(req, a.Snapshot(), clientIP)
 }
 
 // injectAttribution 注入用量归属头（X-Agent-Purpose / X-IDE-* / X-Product）。
@@ -185,11 +205,13 @@ func ExtractClientIP(r *http.Request) string {
 	return ""
 }
 
-// BillingHeaders billing 接口请求头。
-// UA 语义：默认**不设置**（保持现状，Go 客户端自带默认 UA）；仅当显式配置
-// c.UserAgent 非空才覆盖——避免默认路径给 billing 引入新的 UA 指纹。
+// BillingHeaders billing 接口请求头；所有账号字段来自同一 Snapshot。
 func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	c.billingHeadersSnapshot(req, a.Snapshot())
+}
+
+func (c *Client) billingHeadersSnapshot(req *http.Request, s auth.Snapshot) {
+	req.Header.Set("Authorization", "Bearer "+s.AccessToken)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
 	if c != nil && c.UserAgent != "" {
@@ -197,26 +219,37 @@ func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
 	} else if ua := c.billingUA(); ua != "" {
 		req.Header.Set("User-Agent", ua)
 	}
-	if a.UID != "" {
-		req.Header.Set("X-User-Id", a.UID)
+	if s.UID != "" {
+		req.Header.Set("X-User-Id", s.UID)
 	}
-	if a.EnterpriseID != "" {
-		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
-		req.Header.Set("X-Tenant-Id", a.EnterpriseID)
+	if s.EnterpriseID != "" {
+		req.Header.Set("X-Enterprise-Id", s.EnterpriseID)
+		req.Header.Set("X-Tenant-Id", s.EnterpriseID)
 	}
-	if a.Domain != "" {
-		req.Header.Set("X-Domain", a.Domain)
+	if s.Domain != "" {
+		req.Header.Set("X-Domain", s.Domain)
 	}
-	// 设备风控头：billing 域（report/travel/balance/checkin）同样注入。
-	c.injectDeviceToken(req, a)
+	c.injectDeviceTokenSnapshot(req, s)
 }
 
-// RefreshHeaders refresh 端点专属头（X-Refresh-Token 只允许出现在这里）。
+// RefreshHeaders 供普通锁外调用；RefreshToken 已持锁路径使用 refreshHeadersLocked，
+// 避免不可重入 Mutex 的二次加锁。
 func (c *Client) RefreshHeaders(req *http.Request, a *auth.Auth) {
-	c.CommonHeaders(req, a)
-	req.Header.Set("X-Refresh-Token", a.RefreshToken)
-	if a.EnterpriseID != "" {
-		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
+	c.refreshHeadersSnapshot(req, a.Snapshot())
+}
+
+func (c *Client) refreshHeadersLocked(req *http.Request, a *auth.Auth) {
+	c.refreshHeadersSnapshot(req, auth.Snapshot{
+		AccessToken: a.AccessToken, RefreshToken: a.RefreshToken, EnterpriseID: a.EnterpriseID,
+		Domain: a.Domain, UID: a.UID, Site: auth.SiteFrom(a.Site), DeviceToken: a.DeviceToken,
+	})
+}
+
+func (c *Client) refreshHeadersSnapshot(req *http.Request, s auth.Snapshot) {
+	c.commonHeadersSnapshot(req, s)
+	req.Header.Set("X-Refresh-Token", s.RefreshToken)
+	if s.EnterpriseID != "" {
+		req.Header.Set("X-Enterprise-Id", s.EnterpriseID)
 	}
 	req.Header.Set("X-Auth-Refresh-Source", "workbuddy")
 }

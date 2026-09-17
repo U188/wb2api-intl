@@ -40,6 +40,9 @@ type Auth struct {
 
 	AccessToken  string
 	RefreshToken string
+	// Generation 每次凭证身份更新递增，用于锁外网络请求的条件提交，防止 token
+	// 值相同但账号实例/site/file 已被替换时发生 ABA 陈旧覆盖。磁盘无需持久化。
+	Generation   uint64
 	ExpiresAt    int64 // Unix 秒
 	Domain       string
 	UID          string
@@ -53,6 +56,44 @@ type Auth struct {
 	DeviceToken string
 }
 
+// Snapshot 是 Auth 可变凭证字段的一致性只读快照。
+// 出站请求先取一次快照，避免 token 刷新期间分别读取 AccessToken/Domain/ExpiresAt
+// 得到跨版本组合。Snapshot 自己持锁，但绝不能在已持 a.mu 时调用；RefreshToken 的
+// 锁内路径直接使用字段构造 refresh 请求，避免不可重入 Mutex 二次加锁。
+type Snapshot struct {
+	AccessToken  string
+	RefreshToken string
+	ExpiresAt    int64
+	Generation   uint64
+	Domain       string
+	UID          string
+	EnterpriseID string
+	Nickname     string
+	Site         string
+	FilePath     string
+	DeviceToken  string
+}
+
+// Snapshot 返回账号凭证在同一锁时刻的完整副本。
+func (a *Auth) Snapshot() Snapshot {
+	if a == nil {
+		return Snapshot{}
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.snapshotLocked()
+}
+
+// snapshotLocked 仅供已持 a.mu 的调用方使用。
+func (a *Auth) snapshotLocked() Snapshot {
+	return Snapshot{
+		AccessToken: a.AccessToken, RefreshToken: a.RefreshToken, ExpiresAt: a.ExpiresAt,
+		Generation: a.Generation,
+		Domain:     a.Domain, UID: a.UID, EnterpriseID: a.EnterpriseID, Nickname: a.Nickname,
+		Site: SiteFrom(a.Site), FilePath: a.FilePath, DeviceToken: a.DeviceToken,
+	}
+}
+
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
 func (a *Auth) Lock() { a.mu.Lock() }
 
@@ -60,11 +101,13 @@ func (a *Auth) Lock() { a.mu.Lock() }
 func (a *Auth) Unlock() { a.mu.Unlock() }
 
 // NeedsRefresh 报告 token 是否将在 within 内过期（或已过期/无 expiry）。
+// NeedsRefresh 报告 token 是否将在 within 内过期（或已过期/无 expiry）。
 func (a *Auth) NeedsRefresh(within time.Duration) bool {
-	if a.ExpiresAt <= 0 {
+	s := a.Snapshot()
+	if s.ExpiresAt <= 0 {
 		return true
 	}
-	return time.Now().Add(within).Unix() >= a.ExpiresAt
+	return time.Now().Add(within).Unix() >= s.ExpiresAt
 }
 
 // Parse 兼容两种磁盘形态：
@@ -171,7 +214,8 @@ func (a *Auth) SaveAtomic() error {
 		return fmt.Errorf("no FilePath set")
 	}
 	doc := map[string]any{
-		"site": a.Site,
+		"site":         SiteFrom(a.Site),
+		"device_token": a.DeviceToken,
 		"auth": map[string]any{
 			"accessToken":  a.AccessToken,
 			"refreshToken": a.RefreshToken,

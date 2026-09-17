@@ -343,8 +343,15 @@ func (c *Client) chatHTTP() *http.Client {
 	return c.HTTP
 }
 
+func accountSite(a *auth.Auth) string {
+	if a == nil {
+		return auth.SiteCN
+	}
+	return a.Snapshot().Site
+}
+
 func (c *Client) chatBase(a *auth.Auth) string {
-	if a != nil && a.Site == auth.SiteIntl && c.ChatBaseIntl != "" {
+	if accountSite(a) == auth.SiteIntl && c.ChatBaseIntl != "" {
 		return c.ChatBaseIntl
 	}
 	return c.ChatBaseCN
@@ -352,11 +359,11 @@ func (c *Client) chatBase(a *auth.Auth) string {
 
 // prepareBody 组装出站请求体；effort 能力严格按实际账号站点读取。
 func (c *Client) prepareBody(a *auth.Auth, body []byte) []byte {
-	site := auth.SiteCN
-	if a != nil {
-		site = auth.SiteFrom(a.Site)
-	}
-	return PrepareBodyOptWithEfforts(body, c.SanitizeFingerprints, c.effortsSnapshot(site))
+	return c.prepareBodySnapshot(a.Snapshot(), body)
+}
+
+func (c *Client) prepareBodySnapshot(s auth.Snapshot, body []byte) []byte {
+	return PrepareBodyOptWithEfforts(body, c.SanitizeFingerprints, c.effortsSnapshot(s.Site))
 }
 
 // effortsSnapshot 返回指定站点 effort 能力缓存副本。国际目录是随程序内置的，
@@ -387,7 +394,7 @@ func (c *Client) effortsSnapshot(site string) map[string][]string {
 }
 
 func (c *Client) billingBase(a *auth.Auth) string {
-	if a != nil && a.Site == auth.SiteIntl && c.BillingBaseIntl != "" {
+	if accountSite(a) == auth.SiteIntl && c.BillingBaseIntl != "" {
 		return c.BillingBaseIntl
 	}
 	return c.BillingBaseCN
@@ -396,7 +403,7 @@ func (c *Client) billingBase(a *auth.Auth) string {
 // webBase 返回官网域（任务领奖类接口；未注入时回落默认）。
 // 按账号站点分发：国际版无成长任务，实际不会走到；此处统一回落各站默认。
 func (c *Client) webBase(a *auth.Auth) string {
-	if a != nil && a.Site == auth.SiteIntl {
+	if accountSite(a) == auth.SiteIntl {
 		if c.BillingBaseIntl != "" {
 			return c.BillingBaseIntl
 		}
@@ -441,22 +448,31 @@ func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
 	return env.Data, nil
 }
 
-// RefreshToken 刷新 access token；成功时更新 a 的字段（缺省值保留旧值），
-// 调用方负责 SaveAtomic。全程持 a 锁，防止并发 SaveAtomic 读半更新 token。
+// RefreshToken 刷新 access token；网络请求在锁外执行，避免一个慢 RPC 把同账号
+// 的 chat / billing / SaveAtomic 读全部堵住。并发刷新时用原 refreshToken 作版本号：
+// 已有别的刷新完成则不覆盖其新凭证；错误也以已完成的并发刷新为成功。
 func (c *Client) RefreshToken(a *auth.Auth) error {
-	a.Lock()
-	defer a.Unlock()
-	if strings.TrimSpace(a.RefreshToken) == "" {
+	if a == nil {
+		return fmt.Errorf("nil auth")
+	}
+	s := a.Snapshot()
+	if strings.TrimSpace(s.RefreshToken) == "" {
 		return fmt.Errorf("no refreshToken")
 	}
-	url := c.chatBase(a) + "/v2/plugin/auth/token/refresh"
-	req, err := http.NewRequest(http.MethodPost, url, nil)
+	urlBase := c.ChatBaseCN
+	if s.Site == auth.SiteIntl && c.ChatBaseIntl != "" {
+		urlBase = c.ChatBaseIntl
+	}
+	req, err := http.NewRequest(http.MethodPost, urlBase+"/v2/plugin/auth/token/refresh", nil)
 	if err != nil {
 		return err
 	}
-	c.RefreshHeaders(req, a)
+	c.refreshHeadersSnapshot(req, s)
 	data, err := c.doJSON(req)
 	if err != nil {
+		if a.Snapshot().RefreshToken != s.RefreshToken {
+			return nil // 并发刷新已经成功，旧请求的错误不影响新凭证。
+		}
 		return err
 	}
 	var tok struct {
@@ -466,9 +482,19 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 		Domain       string `json:"domain"`
 	}
 	if err := json.Unmarshal(data, &tok); err != nil || tok.AccessToken == "" {
+		if a.Snapshot().RefreshToken != s.RefreshToken {
+			return nil
+		}
 		return fmt.Errorf("refresh_failed: no accessToken in response — re-login required")
 	}
+	a.Lock()
+	defer a.Unlock()
+	if a.Generation != s.Generation || a.RefreshToken != s.RefreshToken || a.AccessToken != s.AccessToken ||
+		a.UID != s.UID || auth.SiteFrom(a.Site) != s.Site || a.FilePath != s.FilePath {
+		return nil // 已被另一轮刷新/热加载取代，不能用旧响应覆盖。
+	}
 	a.AccessToken = tok.AccessToken
+	a.Generation++
 	if tok.RefreshToken != "" {
 		a.RefreshToken = tok.RefreshToken
 	}
@@ -486,12 +512,18 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 // 非 2xx 时 rc 为 nil、body 为上游响应体（供调用方 Classify(status, string(body))）、err 为 nil；
 // 只有传输层失败才返回 err。
 func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string) (rc io.ReadCloser, status int, respBody []byte, err error) {
-	url := c.chatBase(a) + "/v2/chat/completions"
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(c.prepareBody(a, body)))
+	s := a.Snapshot()
+	urlBase := c.ChatBaseCN
+	if auth.SiteFrom(s.Site) == auth.SiteIntl && c.ChatBaseIntl != "" {
+		urlBase = c.ChatBaseIntl
+	}
+	url := urlBase + "/v2/chat/completions"
+	out := c.prepareBodySnapshot(s, body)
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(out))
 	if err != nil {
 		return nil, 0, nil, err
 	}
-	c.ChatHeaders(req, a, clientIP)
+	c.chatHeadersSnapshot(req, s, clientIP)
 	ctx, cancel := context.WithCancel(context.Background())
 	req = req.WithContext(ctx)
 	resp, err := c.chatHTTP().Do(req)
@@ -615,24 +647,29 @@ func normalizeContextWindow(id string, maxInput, maxOutput, maxAllowed int64, le
 // 字段名与上游实际返回对齐：物理上限来自 maxInputTokens/maxOutputTokens，
 // contextWindow 仅描述客户端会话预算档位，不用于改写请求。
 func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
+	if a == nil {
+		return nil, fmt.Errorf("fetch models: account is nil")
+	}
+	s := a.Snapshot()
 	// The international CLI catalog is bundled in product.json. The CN
 	// enterprise models endpoint returns 500 on codebuddy.ai and must never be
 	// used for international discovery.
-	if a != nil && auth.SiteFrom(a.Site) == auth.SiteIntl {
+	if s.Site == auth.SiteIntl {
 		out := IntlBuiltinModels()
 		c.refreshEfforts(auth.SiteIntl, out)
 		return out, nil
 	}
-	if a == nil {
-		return nil, fmt.Errorf("fetch models: account is nil")
+	urlBase := c.ChatBaseCN
+	if s.Site == auth.SiteIntl && c.ChatBaseIntl != "" {
+		urlBase = c.ChatBaseIntl
 	}
-	url := c.chatBase(a) + "/console/enterprises/personal/models"
+	url := urlBase + "/console/enterprises/personal/models"
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
-	c.CommonHeaders(req, a) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	c.commonHeadersSnapshot(req, s)
+	req.Header.Set("Authorization", "Bearer "+s.AccessToken)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err
