@@ -417,7 +417,25 @@ $('btnEye').onclick = () => {
   el.type = show ? 'text' : 'password';
   $('btnEye').textContent = show ? '隐藏' : '显示';
 };
-$('btnCfgReload').onclick = loadConfig;
+$('btnCfgDiscard').onclick = loadConfig;
+$('btnCfgReload').onclick = async () => {
+  const btn = $('btnCfgReload');
+  btn.disabled = true; btn.textContent = '重载中…';
+  try {
+    const r = await api('config/reload', { method: 'POST' });
+    const n = (r.restart_required || []).length;
+    toast(n ? '已从磁盘热重载；仍有 ' + n + ' 项需重启' : '已从磁盘热重载并立即生效', 'ok');
+    await loadConfig();
+  } catch (e) { toast('热重载失败：' + e.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = '从磁盘热重载'; }
+};
+$('btnRestart').onclick = async () => {
+  if (!confirm('服务将优雅退出。Docker/服务管理器需配置自动拉起；确定继续？')) return;
+  try {
+    await api('restart', { method: 'POST' });
+    toast('已接受重启请求，等待服务恢复…', 'ok');
+  } catch (e) { toast('重启失败：' + e.message, 'err'); }
+};
 $('cfgForm').onsubmit = async ev => {
   ev.preventDefault();
   const btn = $('btnCfgSave');

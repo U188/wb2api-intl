@@ -55,3 +55,35 @@ func (p *Panel) saveConfig(w http.ResponseWriter, r *http.Request) {
 		"restart_required": restartRequired,
 	})
 }
+
+func (p *Panel) reloadConfig(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.ReloadConfig == nil {
+		writeErr(w, http.StatusNotImplemented, "config reload api not available")
+		return
+	}
+	fields, err := p.cfg.ReloadConfig()
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if fields == nil {
+		fields = []string{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "restart_required": fields})
+}
+
+func (p *Panel) restart(w http.ResponseWriter, r *http.Request) {
+	if p.apiKey() == "" {
+		writeErr(w, http.StatusForbidden, "restart requires non-empty api_key")
+		return
+	}
+	if p.cfg.Restart == nil {
+		writeErr(w, http.StatusNotImplemented, "restart api not available")
+		return
+	}
+	if err := p.cfg.Restart(); err != nil {
+		writeErr(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "accepted": true})
+}

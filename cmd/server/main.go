@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -184,6 +185,8 @@ func main() {
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		Default1MContext:     cfg.Features.Default1MContext,
 	})
+	restartRequests := make(chan struct{}, 1)
+	var controlMu sync.Mutex
 	pn := panel.New(panel.Config{
 		Pool:             p,
 		Upstream:         up,
@@ -196,11 +199,28 @@ func main() {
 		Live:             live,
 		Default1MContext: cfg.Features.Default1MContext,
 		ConfigPath:       *cfgPath,
-		LoadConfig: func() (any, error) {
-			return Load(*cfgPath)
+		LoadConfig:       func() (any, error) { return Load(*cfgPath) },
+		SaveConfig:       func(raw []byte) ([]string, error) { return saveConfig(raw, *cfgPath, live, p, up, sch) },
+		ReloadConfig: func() ([]string, error) {
+			newCfg, err := Load(*cfgPath)
+			if err != nil {
+				return nil, err
+			}
+			applyRuntimeConfig(newCfg, live, p, up, sch)
+			return restartRequiredFields(newCfg), nil
 		},
-		SaveConfig: func(raw []byte) ([]string, error) {
-			return saveConfig(raw, *cfgPath, live, p, up, sch)
+		Restart: func() error {
+			controlMu.Lock()
+			defer controlMu.Unlock()
+			if _, err := Load(*cfgPath); err != nil {
+				return fmt.Errorf("restart preflight: %w", err)
+			}
+			select {
+			case restartRequests <- struct{}{}:
+				return nil
+			default:
+				return errors.New("restart already pending")
+			}
 		},
 	})
 	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
@@ -224,6 +244,16 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	go func() {
+		select {
+		case <-restartRequests:
+			// 留出响应发送时间；由 Docker/服务管理器监督拉起，不在进程内 fork。
+			time.Sleep(300 * time.Millisecond)
+			log.Printf("panel: restart accepted; graceful shutdown for supervisor restart")
+			stop()
+		case <-ctx.Done():
+		}
+	}()
 	go sch.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 
@@ -373,4 +403,16 @@ func mergedJSON(m map[string]any) []byte {
 		return []byte("{}")
 	}
 	return b
+}
+
+func applyRuntimeConfig(c *Config, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) {
+	live.Store(livecfg.Snapshot{APIKey: c.APIKey, SoftCooldown: c.SoftRateDur, SanitizeFingerprints: c.Features.SanitizeBlacklistFingerprints, Default1MContext: c.Features.Default1MContext})
+	up.SanitizeFingerprints = c.Features.SanitizeBlacklistFingerprints
+	p.SetBreaker(c.Pool.BreakerThreshold, c.BreakerCooldownDur, c.BreakerCooldownMaxD)
+	p.SetDegrade(c.Pool.DegradeThreshold, c.DegradeCooldownDur, c.DegradeCooldownMaxD)
+	p.SetMaxInFlight(c.Pool.MaxInFlight)
+	p.SetSoftRateMax(c.SoftRateMaxDur)
+	p.SetWeights(c.Pool.IdleWeightPerHour, c.Pool.IdleWeightMax)
+	sch.Reconfigure(c.Schedule.CheckinHours, c.Schedule.TravelHours, c.Schedule.ActivityHours, c.Schedule.KeepaliveHours, c.Schedule.BlackcatHours, !c.Schedule.CheckinEnabled, !c.Schedule.TravelEnabled, !c.Schedule.ActivityEnabled, !c.Schedule.KeepaliveEnabled, !c.Schedule.BlackcatEnabled)
+	sch.SetBalanceInterval(c.BalanceRefreshInterval)
 }
