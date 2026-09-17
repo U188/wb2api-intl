@@ -257,10 +257,11 @@ func (s *Scheduler) RunCheckinNow() {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshToken == "" {
+		snap := a.Snapshot()
+		if a == nil || snap.RefreshToken == "" {
 			continue
 		}
-		if a.Site == auth.SiteIntl {
+		if snap.Site == auth.SiteIntl {
 			// 国际版无签到/成长体系：跳过 DailyCheckin，只查余额保持解冻语义。
 			remain, total, err := s.cfg.Upstream.UserResource(a)
 			if err != nil {
@@ -302,10 +303,11 @@ func (s *Scheduler) RunActivityNow() {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.AccessToken == "" {
+		snap := a.Snapshot()
+		if a == nil || snap.AccessToken == "" {
 			continue
 		}
-		if a.Site == auth.SiteIntl {
+		if snap.Site == auth.SiteIntl {
 			continue // 国际版无 growth 连登体系，活跃上报无意义
 		}
 		if !first {
@@ -314,7 +316,7 @@ func (s *Scheduler) RunActivityNow() {
 		first = false
 		cid := fmt.Sprintf("wb2api-%d", time.Now().UnixMilli())
 		if err := s.cfg.Upstream.ReportChatActivity(a, cid, ""); err != nil {
-			log.Printf("activity %s: %v", a.UID, err)
+			log.Printf("activity %s: %v", a.Snapshot().UID, err)
 			continue
 		}
 		s.checkActivityStreak(a) // 上报成功 → 回读 streak 自检
@@ -331,14 +333,14 @@ func (s *Scheduler) RunActivityNow() {
 func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 	days, err := s.cfg.Upstream.GrowthStreak(a)
 	if err != nil {
-		log.Printf("activity %s: streak check failed (report OK): %v", a.UID, err)
+		log.Printf("activity %s: streak check failed (report OK): %v", a.Snapshot().UID, err)
 		return true
 	}
 	if days == 0 {
-		log.Printf("activity %s: report OK but streak.days=0 (silent drop?)", a.UID)
+		log.Printf("activity %s: report OK but streak.days=0 (silent drop?)", a.Snapshot().UID)
 		return true
 	}
-	log.Printf("activity %s: streak days=%d", a.UID, days)
+	log.Printf("activity %s: streak days=%d", a.Snapshot().UID, days)
 	return false
 }
 
@@ -352,7 +354,8 @@ func (s *Scheduler) RunKeepaliveNow() {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshToken == "" {
+		snap := a.Snapshot()
+		if a == nil || snap.RefreshToken == "" {
 			continue
 		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {

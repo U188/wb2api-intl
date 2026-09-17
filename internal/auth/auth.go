@@ -37,6 +37,8 @@ func SiteFrom(s string) string {
 type Auth struct {
 	// mu 串行化 RefreshToken 写与 SaveAtomic 读，防止并发写回半更新 token。
 	mu sync.Mutex
+	// refreshMu serializes network refreshes without blocking readers of mu.
+	refreshMu sync.Mutex
 
 	AccessToken  string
 	RefreshToken string
@@ -84,6 +86,9 @@ func (a *Auth) Snapshot() Snapshot {
 	return a.snapshotLocked()
 }
 
+// SnapshotLocked returns a copy while mu is held by the caller.
+func (a *Auth) SnapshotLocked() Snapshot { return a.snapshotLocked() }
+
 // snapshotLocked 仅供已持 a.mu 的调用方使用。
 func (a *Auth) snapshotLocked() Snapshot {
 	return Snapshot{
@@ -100,7 +105,12 @@ func (a *Auth) Lock() { a.mu.Lock() }
 // Unlock 释放 a.Lock 获取的锁。
 func (a *Auth) Unlock() { a.mu.Unlock() }
 
-// NeedsRefresh 报告 token 是否将在 within 内过期（或已过期/无 expiry）。
+// LockRefresh serializes refresh requests for this Auth without blocking Snapshot.
+func (a *Auth) LockRefresh() { a.refreshMu.Lock() }
+
+// UnlockRefresh releases LockRefresh.
+func (a *Auth) UnlockRefresh() { a.refreshMu.Unlock() }
+
 // NeedsRefresh 报告 token 是否将在 within 内过期（或已过期/无 expiry）。
 func (a *Auth) NeedsRefresh(within time.Duration) bool {
 	s := a.Snapshot()
@@ -232,20 +242,36 @@ func (a *Auth) SaveAtomic() error {
 	if err != nil {
 		return err
 	}
-	tmp := a.FilePath + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		// Docker bind-mount 权限问题的典型现场：容器内 app 用户（uid 10001）
-		// 对宿主机挂载目录无写权限。给出可操作指引而不是裸 syscall 错误。
-		msg := fmt.Sprintf("写入 %s 失败: %v", tmp, err)
-		if errors.Is(err, fs.ErrPermission) {
-			msg += "\n（Docker 部署：容器内用户对宿主机挂载目录无写权限。解法任选：" +
-				"1) 以本机 uid 运行容器：PUID=$(id -u) PGID=$(id -g) docker compose up -d；" +
-				"2) sudo chown -R 10001:10001 ./auths ./data ./config.json；" +
-				"3) compose 设 user: \"0:0\" 以 root 运行）"
-		}
-		return errors.New(msg)
+	// A unique sibling file prevents unrelated Auth instances from sharing a .tmp name.
+	f, err := os.CreateTemp(filepath.Dir(a.FilePath), "."+filepath.Base(a.FilePath)+"-*.tmp")
+	if err != nil {
+		return saveWriteError(a.FilePath, err)
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return saveWriteError(tmp, err)
+	}
+	if _, err := f.Write(raw); err != nil {
+		f.Close()
+		return saveWriteError(tmp, err)
+	}
+	if err := f.Close(); err != nil {
+		return saveWriteError(tmp, err)
 	}
 	return os.Rename(tmp, a.FilePath)
+}
+
+func saveWriteError(path string, err error) error {
+	msg := fmt.Sprintf("写入 %s 失败: %v", path, err)
+	if errors.Is(err, fs.ErrPermission) {
+		msg += "\n（Docker 部署：容器内用户对宿主机挂载目录无写权限。解法任选：" +
+			"1) 以本机 uid 运行容器：PUID=$(id -u) PGID=$(id -g) docker compose up -d；" +
+			"2) sudo chown -R 10001:10001 ./auths ./data ./config.json；" +
+			"3) compose 设 user: \"0:0\" 以 root 运行）"
+	}
+	return errors.New(msg)
 }
 
 // LoadDir 扫描并解析 dir 下 workbuddy*.json；解析失败的文件静默跳过（启动日志由调用方统计）。

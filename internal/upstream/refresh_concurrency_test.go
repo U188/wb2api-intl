@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"strings"
@@ -47,7 +48,7 @@ func TestRefreshTokenDoesNotHoldAuthLockDuringNetwork(t *testing.T) {
 	select {
 	case s := <-snapDone:
 		if s.AccessToken != "old-at" {
-			t.Fatalf("snapshot during refresh=%+v", s)
+			t.Fatal("unexpected snapshot during refresh")
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("auth lock held during refresh network request")
@@ -57,7 +58,7 @@ func TestRefreshTokenDoesNotHoldAuthLockDuringNetwork(t *testing.T) {
 		t.Fatalf("RefreshToken: %v", err)
 	}
 	if got := a.Snapshot(); got.AccessToken != "new-at" || got.RefreshToken != "new-rt" {
-		t.Fatalf("refresh not committed: %+v", got)
+		t.Fatal("refresh not committed")
 	}
 }
 
@@ -81,11 +82,105 @@ func TestRefreshTokenStaleResponseDoesNotOverwriteNewerCredentials(t *testing.T)
 	a.FilePath = "replacement.json"
 	a.Unlock()
 	close(block.release)
-	if err := <-done; err != nil {
-		t.Fatalf("stale refresh returned error: %v", err)
+	if err := <-done; err == nil {
+		t.Fatal("identity replacement must not be reported as refresh success")
 	}
 	if got := a.Snapshot(); got.AccessToken != "old-at" || got.RefreshToken != "old-rt" ||
 		got.Site != auth.SiteIntl || got.FilePath != "replacement.json" || got.Generation != 1 {
-		t.Fatalf("stale response overwrote newer credentials: %+v", got)
+		t.Fatal("stale response overwrote newer credentials")
+	}
+}
+
+func TestRefreshTokenSerializesRotatingToken(t *testing.T) {
+	block := &blockingRoundTripper{started: make(chan struct{}), release: make(chan struct{}),
+		body: `{"code":0,"data":{"accessToken":"new-at","refreshToken":"new-rt"}}`}
+	c := New()
+	var calls int
+	var mu sync.Mutex
+	c.HTTP = &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		return block.RoundTrip(r)
+	})}
+	a := &auth.Auth{AccessToken: "old-at", RefreshToken: "old-rt", Site: auth.SiteCN}
+	done := make(chan error, 2)
+	go func() { done <- c.RefreshToken(a) }()
+	<-block.started
+	go func() { done <- c.RefreshToken(a) }()
+	// Give the second caller time to capture its pre-wait snapshot.
+	time.Sleep(50 * time.Millisecond)
+	close(block.release)
+	for i := 0; i < 2; i++ {
+		if err := <-done; err != nil {
+			t.Fatal("concurrent refresh failed")
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 1 || a.Snapshot().Generation != 1 {
+		t.Fatal("rotating refresh token was reused")
+	}
+}
+
+func TestRefreshResultIdentityAndCredentialChecks(t *testing.T) {
+	original := auth.Snapshot{Generation: 1, AccessToken: "a", RefreshToken: "r", Site: auth.SiteCN, UID: "u", FilePath: "f"}
+	for _, field := range []string{"site", "uid", "file", "access", "refresh", "generation"} {
+		t.Run(field, func(t *testing.T) {
+			current := original
+			switch field {
+			case "site":
+				current.Site = auth.SiteIntl
+				current.Generation++
+			case "uid":
+				current.UID = "other"
+				current.Generation++
+			case "file":
+				current.FilePath = "other"
+				current.Generation++
+			case "access":
+				current.AccessToken = "other"
+			case "refresh":
+				current.RefreshToken = "other"
+			case "generation":
+				current.Generation++
+			}
+			err := refreshResult(current, original, io.ErrUnexpectedEOF)
+			if (err == nil) != (field == "generation") {
+				t.Fatal("inconsistent stale refresh error suppression")
+			}
+		})
+	}
+}
+
+func TestChatStreamContextCancelAndClose(t *testing.T) {
+	for _, idle := range []time.Duration{0, time.Second} {
+		for _, cancelParent := range []bool{false, true} {
+			ctx, cancel := context.WithCancel(context.Background())
+			c := New()
+			c.IdleTimeout = idle
+			var requestContext context.Context
+			c.ChatHTTP = &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+				requestContext = r.Context()
+				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("data: done\n\n"))}, nil
+			})}
+			rc, _, _, err := c.ChatStreamContext(ctx, &auth.Auth{AccessToken: "a"}, []byte(`{}`), "")
+			if err != nil {
+				cancel()
+				t.Fatal("stream creation failed")
+			}
+			if cancelParent {
+				cancel()
+			} else {
+				rc.Close()
+			}
+			select {
+			case <-requestContext.Done():
+			case <-time.After(time.Second):
+				t.Fatal("stream context not released")
+			}
+			rc.Close()
+			cancel()
+		}
 	}
 }

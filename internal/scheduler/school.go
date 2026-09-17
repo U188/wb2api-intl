@@ -29,10 +29,11 @@ func (s *Scheduler) RunSchoolNow() {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.AccessToken == "" {
+		snap := a.Snapshot()
+		if a == nil || snap.AccessToken == "" {
 			continue
 		}
-		if a.Site == auth.SiteIntl {
+		if snap.Site == auth.SiteIntl {
 			continue // 开学季活动是国内版活动，国际版无
 		}
 		s.schoolAccount(a)
@@ -43,7 +44,7 @@ func (s *Scheduler) RunSchoolNow() {
 // RunSchoolAccountNow 单账号开学季闭环（面板任务中心逐账号执行用）：
 // 四任务独立处理 + 抽完抽奖次数，与每日排程同语义。
 func (s *Scheduler) RunSchoolAccountNow(a *auth.Auth) {
-	if a == nil || auth.SiteFrom(a.Site) != auth.SiteCN {
+	if a == nil || a.Snapshot().Site != auth.SiteCN {
 		return
 	}
 	s.schoolAccount(a)
@@ -59,7 +60,7 @@ func (s *Scheduler) RunSchoolAccountNow(a *auth.Auth) {
 func (s *Scheduler) schoolAccount(a *auth.Auth) {
 	tasks, inPeriod, err := s.cfg.Upstream.SchoolTasks(a)
 	if err != nil {
-		log.Printf("school %s: tasks: %v", a.UID, err)
+		log.Printf("school %s: tasks: %v", a.Snapshot().UID, err)
 		return
 	}
 	if !inPeriod {
@@ -78,10 +79,10 @@ func (s *Scheduler) schoolAccount(a *auth.Auth) {
 	for i := 0; i < chances; i++ {
 		prize, err := s.cfg.Upstream.SchoolDraw(a)
 		if err != nil {
-			log.Printf("school %s: draw: %v", a.UID, err)
+			log.Printf("school %s: draw: %v", a.Snapshot().UID, err)
 			return
 		}
-		log.Printf("school %s: 🎲 %s", a.UID, prize)
+		log.Printf("school %s: 🎲 %s", a.Snapshot().UID, prize)
 		time.Sleep(2 * time.Second)
 	}
 }
@@ -97,19 +98,19 @@ func (s *Scheduler) schoolShareTask(a *auth.Auth) {
 		return
 	}
 	if err := s.cfg.Upstream.SchoolShareComplete(a); err != nil {
-		log.Printf("school %s: share-complete: %v", a.UID, err)
+		log.Printf("school %s: share-complete: %v", a.Snapshot().UID, err)
 		return
 	}
 	if !s.schoolPollDone(a, "share_invite") {
-		log.Printf("school %s: share-complete 上报后未点亮（明日重试）", a.UID)
+		log.Printf("school %s: share-complete 上报后未点亮（明日重试）", a.Snapshot().UID)
 		return
 	}
 	granted, err := s.cfg.Upstream.SchoolClaimTask(a, "share_invite")
 	if err != nil {
-		log.Printf("school %s: share claim: %v", a.UID, err)
+		log.Printf("school %s: share claim: %v", a.Snapshot().UID, err)
 		return
 	}
-	log.Printf("school %s: ★ 分享任务完成，+100c +%d 抽奖次数", a.UID, granted)
+	log.Printf("school %s: ★ 分享任务完成，+100c +%d 抽奖次数", a.Snapshot().UID, granted)
 }
 
 // schoolPollDone 轮询任务是否达标（异步计分，最多 schoolPollLoops 次）。
@@ -139,27 +140,27 @@ func (s *Scheduler) schoolChatTimesTask(a *auth.Auth) {
 	}
 	if t.Status == "pending" {
 		if err := s.cfg.Upstream.SchoolTaskViewed(a, "chat_3_times"); err != nil {
-			log.Printf("school %s: chat viewed: %v", a.UID, err)
+			log.Printf("school %s: chat viewed: %v", a.Snapshot().UID, err)
 			return
 		}
 	}
 	for i := 0; i < t.TargetCount && i < 5; i++ {
 		if err := s.cfg.Upstream.ReportMPEvent(a, upstream.SchoolChatTimesEvents(fmt.Sprintf("wb2api-chat-%d-%d", time.Now().Unix(), i))); err != nil {
-			log.Printf("school %s: chat events: %v", a.UID, err)
+			log.Printf("school %s: chat events: %v", a.Snapshot().UID, err)
 			return
 		}
 		time.Sleep(2 * time.Second)
 	}
 	if !s.schoolPollDone(a, "chat_3_times") {
-		log.Printf("school %s: chat_3_times 未点亮（明日重试）", a.UID)
+		log.Printf("school %s: chat_3_times 未点亮（明日重试）", a.Snapshot().UID)
 		return
 	}
 	granted, err := s.cfg.Upstream.SchoolClaimTask(a, "chat_3_times")
 	if err != nil {
-		log.Printf("school %s: chat claim: %v", a.UID, err)
+		log.Printf("school %s: chat claim: %v", a.Snapshot().UID, err)
 		return
 	}
-	log.Printf("school %s: ★ 对话任务完成，+50c +%d 抽奖次数", a.UID, granted)
+	log.Printf("school %s: ★ 对话任务完成，+50c +%d 抽奖次数", a.Snapshot().UID, granted)
 }
 
 // schoolExpertTask 完成 expert_use：viewed → 专家事件链 → 轮询 → 领奖。
@@ -175,26 +176,26 @@ func (s *Scheduler) schoolExpertTask(a *auth.Auth) {
 	}
 	if t.Status == "pending" {
 		if err := s.cfg.Upstream.SchoolTaskViewed(a, "expert_use"); err != nil {
-			log.Printf("school %s: expert viewed: %v", a.UID, err)
+			log.Printf("school %s: expert viewed: %v", a.Snapshot().UID, err)
 			return
 		}
 	}
 	events := upstream.SchoolExpertUseEvents("ex_jB0dyFIQJEWa", "论文写作导师",
 		fmt.Sprintf("wb2api-exp-%d", time.Now().Unix()))
 	if err := s.cfg.Upstream.ReportMPEvent(a, events...); err != nil {
-		log.Printf("school %s: expert events: %v", a.UID, err)
+		log.Printf("school %s: expert events: %v", a.Snapshot().UID, err)
 		return
 	}
 	if !s.schoolPollDone(a, "expert_use") {
-		log.Printf("school %s: expert_use 未点亮（明日重试）", a.UID)
+		log.Printf("school %s: expert_use 未点亮（明日重试）", a.Snapshot().UID)
 		return
 	}
 	granted, err := s.cfg.Upstream.SchoolClaimTask(a, "expert_use")
 	if err != nil {
-		log.Printf("school %s: expert claim: %v", a.UID, err)
+		log.Printf("school %s: expert claim: %v", a.Snapshot().UID, err)
 		return
 	}
-	log.Printf("school %s: ★ 专家任务完成，+50c +%d 抽奖次数", a.UID, granted)
+	log.Printf("school %s: ★ 专家任务完成，+50c +%d 抽奖次数", a.Snapshot().UID, granted)
 }
 
 // schoolDesktopTask 完成 desktop_chat_1_time：viewed 激活 → 真实 chat → 六事件链。
@@ -209,18 +210,18 @@ func (s *Scheduler) schoolDesktopTask(a *auth.Auth) {
 	}
 	if t.Status == "pending" {
 		if err := s.cfg.Upstream.SchoolTaskViewed(a, "desktop_chat_1_time"); err != nil {
-			log.Printf("school %s: desktop viewed: %v", a.UID, err)
+			log.Printf("school %s: desktop viewed: %v", a.Snapshot().UID, err)
 			return
 		}
 	}
 	conv, req, err := s.cfg.Upstream.DesktopChatWithExpert(a, "")
 	if err != nil {
-		log.Printf("school %s: desktop chat: %v", a.UID, err)
+		log.Printf("school %s: desktop chat: %v", a.Snapshot().UID, err)
 		return
 	}
 	events := upstream.DesktopChatSequence(conv, req, "msg-"+req[len(req)-8:], "fast-model", "fast-model")
 	if err := s.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
-		log.Printf("school %s: desktop events: %v", a.UID, err)
+		log.Printf("school %s: desktop events: %v", a.Snapshot().UID, err)
 		return
 	}
 	// 异步计分轮询后领奖（失败不阻塞 share 主流程）。
@@ -232,12 +233,12 @@ func (s *Scheduler) schoolDesktopTask(a *auth.Auth) {
 		}
 		if t2 := findSchoolTask(tasks2, "desktop_chat_1_time"); t2 != nil && t2.Progress >= t2.TargetCount {
 			if granted, err := s.cfg.Upstream.SchoolClaimTask(a, "desktop_chat_1_time"); err == nil {
-				log.Printf("school %s: ★ 桌面端体验任务完成 +100c +%d 抽奖", a.UID, granted)
+				log.Printf("school %s: ★ 桌面端体验任务完成 +100c +%d 抽奖", a.Snapshot().UID, granted)
 			}
 			return
 		}
 	}
-	log.Printf("school %s: desktop_chat_1_time 未点亮（明日重试）", a.UID)
+	log.Printf("school %s: desktop_chat_1_time 未点亮（明日重试）", a.Snapshot().UID)
 }
 
 // findSchoolTask 按任务码查条目。

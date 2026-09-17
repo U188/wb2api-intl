@@ -67,6 +67,8 @@ type Status struct {
 	Until           time.Time  `json:"until,omitempty"`
 	Reason          string     `json:"reason,omitempty"`
 	SoftStreak      int        `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
+	DegradeFails    int        `json:"degrade_fails,omitempty"`
+	DegradeUntil    time.Time  `json:"degrade_until,omitempty"`
 	Disabled        bool       `json:"disabled"`
 	DisabledReason  string     `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
 	SuccessCount    int64      `json:"success_count,omitempty"`
@@ -108,6 +110,9 @@ type entry struct {
 	// 仅当冷却由「带解析时间的 6004」触发时记录；空 = 普通软冷却（不豁免）。
 	// 运行态语义（不持久化）：重启清零，退化为现状。
 	softRateModel string
+	// 连败降权：仅接收 ErrClient/传输失败等“没有权威处罚”的失败。
+	consecutiveFails int
+	degradeUntil     time.Time
 	// sessionDeadFails 连续 12153（ErrSessionDead）计数。12153 在真实环境会被临时性触发
 	// （网络抖动/上游闪断/refresh 竞态），一次失败就永久禁用太粗暴——连续达到阈值才判死。
 	// 运行态语义（不持久化，与 inFlight 同语义）：重启清零可接受——重启后首个 keepalive
@@ -117,7 +122,7 @@ type entry struct {
 	inFlight atomic.Int64
 }
 
-// healthy 报告账号当前是否可选（未禁用、未处于任一冷却/熔断期）。
+// healthy 报告账号当前是否可选（未禁用、未处于任一冷却/熔断/连败降权期）。
 func (e *entry) healthy(now time.Time) bool {
 	if e.disabled {
 		return false
@@ -126,6 +131,9 @@ func (e *entry) healthy(now time.Time) bool {
 		return false
 	}
 	if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
+		return false
+	}
+	if !e.degradeUntil.IsZero() && now.Before(e.degradeUntil) {
 		return false
 	}
 	return true
@@ -146,35 +154,34 @@ func (e *entry) modelExempt() bool {
 func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
 	if !e.healthy(now) && reqModel != "" && e.softRateModel != "" &&
 		e.coolKind == CoolSoft && e.softRateModel != reqModel {
-		// 非 healthy 但属于可豁免场景：仍受 disabled/breakerUntil 约束。
-		return !e.disabled && e.breakerUntil.IsZero()
+		// 仅豁免模型级 soft cooldown；disabled/breaker/degrade 仍必须阻断。
+		return !e.disabled && e.breakerUntil.IsZero() &&
+			(e.degradeUntil.IsZero() || !now.Before(e.degradeUntil))
 	}
 	return e.healthy(now)
 }
 
-// expiry 返回账号当前仍在生效的最近冷却/熔断截止时间（两个截止取较早者）；不在冷却期返回零值。
-// 供全冷却兜底选取"最早到期"账号用。
+// expiry 返回账号仍生效的最近冷却/熔断/连败降权截止时间；无截止返回零值。
 func (e *entry) expiry(now time.Time) time.Time {
 	var t time.Time
-	if !e.until.IsZero() && now.Before(e.until) {
-		t = e.until
-	}
-	if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
-		if t.IsZero() || e.breakerUntil.Before(t) {
-			t = e.breakerUntil
+	for _, until := range []time.Time{e.until, e.breakerUntil, e.degradeUntil} {
+		if !until.IsZero() && now.Before(until) && (t.IsZero() || until.Before(t)) {
+			t = until
 		}
 	}
 	return t
 }
 
-// fallbackKind 报告兜底账号属于哪一类冷却（soft：即时软冷却；breaker：熔断期）。
-// 只对参与兜底的账号调用（CoolHard 已被 pickEarliestExpiryLocked 排除）。判定口径：
-// 若熔断截止是当前生效的最近截止（含"仅有熔断无软冷却"），记为 breaker；否则记为 soft。
+// fallbackKind 报告兜底账号属于哪一类截止。
 func (e *entry) fallbackKind(now time.Time) string {
-	if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
-		if e.until.IsZero() || !now.Before(e.until) || e.breakerUntil.Before(e.until) {
-			return "breaker"
-		}
+	if !e.degradeUntil.IsZero() && now.Before(e.degradeUntil) &&
+		(e.until.IsZero() || !now.Before(e.until) || e.degradeUntil.Before(e.until)) &&
+		(e.breakerUntil.IsZero() || !now.Before(e.breakerUntil) || e.degradeUntil.Before(e.breakerUntil)) {
+		return "degrade"
+	}
+	if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) &&
+		(e.until.IsZero() || !now.Before(e.until) || e.breakerUntil.Before(e.until)) {
+		return "breaker"
 	}
 	return "soft"
 }
@@ -197,7 +204,9 @@ type stateAccount struct {
 	TokenUsage  TokenUsage `json:"token_usage,omitempty"`
 	// SoftStreak 连续软冷却次数（软退避指数）。旧 state.json 缺此字段 → 零值，
 	// 退避从基数重新开始（向后兼容）。
-	SoftStreak int `json:"soft_streak,omitempty"`
+	SoftStreak       int       `json:"soft_streak,omitempty"`
+	ConsecutiveFails int       `json:"degrade_fails,omitempty"`
+	DegradeUntil     time.Time `json:"degrade_until,omitempty"`
 }
 
 // stateFile 持久化格式。
@@ -210,6 +219,12 @@ const (
 	defaultBreakerThreshold   = 3
 	defaultBreakerCooldown    = 30 * time.Minute
 	defaultBreakerCooldownMax = 6 * time.Hour
+)
+
+const (
+	defaultDegradeThreshold   = 5
+	defaultDegradeCooldown    = 10 * time.Minute
+	defaultDegradeCooldownMax = 2 * time.Hour
 )
 
 // defaultSoftRateMax 软冷却指数退避的默认封顶：softRateMax 未注入（<=0）时按此值算，

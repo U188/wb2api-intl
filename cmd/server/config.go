@@ -126,6 +126,9 @@ type Config struct {
 		BreakerCooldownMax string  `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
 		IdleWeightPerHour  float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
 		IdleWeightMax      float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
+		DegradeThreshold   int     `json:"degrade_threshold"`    // 未知失败连败阈值，默认 5
+		DegradeCooldown    string  `json:"degrade_cooldown"`     // 连败降权时长，默认 10m
+		DegradeCooldownMax string  `json:"degrade_cooldown_max"` // 连败降权封顶，默认 2h
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -138,6 +141,8 @@ type Config struct {
 	SoftRateDur            time.Duration `json:"-"`
 	SoftRateMaxDur         time.Duration `json:"-"`
 	BreakerCooldownDur     time.Duration `json:"-"`
+	DegradeCooldownDur     time.Duration `json:"-"`
+	DegradeCooldownMaxD    time.Duration `json:"-"`
 	BreakerCooldownMaxD    time.Duration `json:"-"`
 	SessionTTL             time.Duration `json:"-"`
 	SessionGCInterval      time.Duration `json:"-"`
@@ -179,6 +184,9 @@ func Default() *Config {
 	c.Pool.MaxInFlight = 3
 	c.Pool.BreakerThreshold = 3
 	c.Pool.BreakerCooldown = "30m"
+	c.Pool.DegradeThreshold = 5
+	c.Pool.DegradeCooldown = "10m"
+	c.Pool.DegradeCooldownMax = "2h"
 	c.Pool.BreakerCooldownMax = "6h"
 	c.Pool.IdleWeightPerHour = 0.5
 	c.Pool.IdleWeightMax = 5.0
@@ -368,6 +376,18 @@ func (c *Config) normalize() error {
 	if c.BreakerCooldownMaxD, err = time.ParseDuration(c.Pool.BreakerCooldownMax); err != nil {
 		return fmt.Errorf("pool.breaker_cooldown_max: %w", err)
 	}
+	if c.Pool.DegradeCooldown == "" {
+		c.Pool.DegradeCooldown = "10m"
+	}
+	if c.Pool.DegradeCooldownMax == "" {
+		c.Pool.DegradeCooldownMax = "2h"
+	}
+	if c.DegradeCooldownDur, err = time.ParseDuration(c.Pool.DegradeCooldown); err != nil || c.DegradeCooldownDur <= 0 {
+		return fmt.Errorf("pool.degrade_cooldown: 必须是正时长: %q", c.Pool.DegradeCooldown)
+	}
+	if c.DegradeCooldownMaxD, err = time.ParseDuration(c.Pool.DegradeCooldownMax); err != nil || c.DegradeCooldownMaxD <= 0 {
+		return fmt.Errorf("pool.degrade_cooldown_max: 必须是正时长: %q", c.Pool.DegradeCooldownMax)
+	}
 	if c.SessionTTL, err = time.ParseDuration(c.SessionSticky.TTL); err != nil {
 		return fmt.Errorf("session_sticky.ttl: %w", err)
 	}
@@ -376,6 +396,9 @@ func (c *Config) normalize() error {
 	}
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3
+	}
+	if c.Pool.DegradeThreshold <= 0 {
+		c.Pool.DegradeThreshold = 5
 	}
 	if c.Pool.IdleWeightPerHour <= 0 {
 		c.Pool.IdleWeightPerHour = 0.5

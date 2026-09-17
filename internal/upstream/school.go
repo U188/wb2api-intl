@@ -24,8 +24,9 @@ const schoolBase = "/portal/activity/school"
 
 // schoolJSON 学院活动 API 请求（剥信封，业务 code≠0 返回带 msg 的 error）。
 func (c *Client) schoolJSON(a *auth.Auth, method, path string, body map[string]any, out any) error {
-	if err := requireCNGamification(a); err != nil {
-		return err
+	s := a.Snapshot()
+	if a == nil || s.Site != auth.SiteCN {
+		return errCNGamificationOnly
 	}
 	var raw []byte
 	if body != nil {
@@ -35,11 +36,11 @@ func (c *Client) schoolJSON(a *auth.Auth, method, path string, body map[string]a
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+s.AccessToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	if a.UID != "" {
-		req.Header.Set("X-User-Id", a.UID)
+	if s.UID != "" {
+		req.Header.Set("X-User-Id", s.UID)
 	}
 	data, err := c.doJSON(req)
 	if err != nil {
@@ -133,7 +134,9 @@ func (c *Client) SchoolDraw(a *auth.Auth) (string, error) {
 const mpReportPath = "/v2/report"
 
 // mpEventBase 小程序埋点公共指纹（appservice wQ()+Ao() 对齐）。
-func mpEventBase(a *auth.Auth) map[string]any {
+func mpEventBase(a *auth.Auth) map[string]any { return mpEventBaseSnapshot(a.Snapshot()) }
+
+func mpEventBaseSnapshot(s auth.Snapshot) map[string]any {
 	return map[string]any{
 		"timestamp":    time.Now().UnixMilli(),
 		"ideType":      "WorkBuddy_MP",
@@ -148,20 +151,21 @@ func mpEventBase(a *auth.Auth) map[string]any {
 		"arch":         "x64",
 		"machineId":    "0655736a-607f-4d9d-b430-58176ee9a090",
 		"timezone":     "Asia/Shanghai",
-		"userId":       a.UID,
-		"userNickname": a.Nickname,
+		"userId":       s.UID,
+		"userNickname": s.Nickname,
 	}
 }
 
 // ReportMPEvent 以小程序指纹向 www.codebuddy.cn/v2/report 批量上报事件。
 func (c *Client) ReportMPEvent(a *auth.Auth, events ...map[string]any) error {
-	if err := requireCNGamification(a); err != nil {
-		return err
+	s := a.Snapshot()
+	if a == nil || s.Site != auth.SiteCN {
+		return errCNGamificationOnly
 	}
 	if len(events) == 0 {
 		return fmt.Errorf("mp report: no events")
 	}
-	base := mpEventBase(a)
+	base := mpEventBaseSnapshot(s)
 	arr := make([]map[string]any, 0, len(events))
 	for _, ev := range events {
 		m := map[string]any{}
@@ -181,11 +185,11 @@ func (c *Client) ReportMPEvent(a *auth.Auth, events ...map[string]any) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+s.AccessToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	if a.UID != "" {
-		req.Header.Set("X-User-Id", a.UID)
+	if s.UID != "" {
+		req.Header.Set("X-User-Id", s.UID)
 	}
 	req.Header.Set("X-Client-Product", "workbuddy-mp")
 	req.Header.Set("X-Client-Version", "2.4.0")

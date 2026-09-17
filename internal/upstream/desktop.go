@@ -48,8 +48,10 @@ func (c *Client) desktopBase(a *auth.Auth) string { return c.chatBase(a) }
 
 // deriveID 由 uid 稳定派生一个 36 位 hex 设备标识（machineId/qimei36 复用），
 // 幂等：同一账号每次生成相同值，模拟固定设备。
-func deriveID(a *auth.Auth, salt string) string {
-	sum := sha256.Sum256([]byte(salt + ":" + a.UID))
+func deriveID(a *auth.Auth, salt string) string { return deriveIDSnapshot(a.Snapshot(), salt) }
+
+func deriveIDSnapshot(s auth.Snapshot, salt string) string {
+	sum := sha256.Sum256([]byte(salt + ":" + s.UID))
 	return hex.EncodeToString(sum[:18]) // 36 hex chars
 }
 
@@ -57,22 +59,24 @@ func deriveID(a *auth.Auth, salt string) string {
 type DesktopEvent map[string]any
 
 // desktopFingerprint 公共桌面指纹字段（注入每个事件，覆盖同名业务键）。
-func desktopFingerprint(a *auth.Auth) map[string]any {
+func desktopFingerprint(a *auth.Auth) map[string]any { return desktopFingerprintSnapshot(a.Snapshot()) }
+
+func desktopFingerprintSnapshot(s auth.Snapshot) map[string]any {
 	now := time.Now().UnixMilli()
 	return map[string]any{
 		"timezone":     "Asia/Shanghai",
 		"reportDelay":  2000,
-		"userId":       a.UID,
-		"username":     a.Nickname,
-		"userNickname": a.Nickname,
+		"userId":       s.UID,
+		"username":     s.Nickname,
+		"userNickname": s.Nickname,
 		"product":      "SaaS",
 		"releaseDate":  int64(1789036585355),
 		"commit":       "5f9692923c93033111c51ad7b003eb80204a9b75",
 		"ideName":      "WorkBuddy",
 		"ideType":      "WorkBuddy",
 		"ideVersion":   "5.5.6",
-		"machineId":    deriveID(a, "machine"),
-		"sessionId":    deriveID(a, "session"),
+		"machineId":    deriveIDSnapshot(s, "machine"),
+		"sessionId":    deriveIDSnapshot(s, "session"),
 		"extName":      "workbuddy-desktop",
 		"extVersion":   "5.5.6",
 		"os":           "win32",
@@ -89,13 +93,14 @@ func desktopFingerprint(a *auth.Auth) map[string]any {
 // events 为业务载荷（eventCode 等字段由调用方给出）；公共指纹自动注入，
 // 业务字段优先（可用于覆盖 qimei36/machineId 等设备标识做真实设备对齐）。
 func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error {
-	if err := requireCNGamification(a); err != nil {
-		return err
+	s := a.Snapshot()
+	if a == nil || s.Site != auth.SiteCN {
+		return errCNGamificationOnly
 	}
 	if len(events) == 0 {
 		return fmt.Errorf("desktop report: no events")
 	}
-	fp := desktopFingerprint(a)
+	fp := desktopFingerprintSnapshot(s)
 	arr := make([]map[string]any, 0, len(events))
 	for _, ev := range events {
 		m := map[string]any{}
@@ -111,19 +116,19 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPost, c.desktopBase(a)+desktopReportPath, bytes.NewReader(raw))
+	req, err := http.NewRequest(http.MethodPost, c.chatBaseSnapshot(s)+desktopReportPath, bytes.NewReader(raw))
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+s.AccessToken)
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
 	req.Header.Set("User-Agent", desktopUA)
-	req.Header.Set("X-Domain", c.desktopBase(a))
+	req.Header.Set("X-Domain", c.chatBaseSnapshot(s))
 	req.Header.Set("X-Product", "SaaS")
-	req.Header.Set("X-Request-ID", deriveID(a, "req")+fmt.Sprintf("%d", time.Now().UnixNano()%1e6))
-	if a.UID != "" {
-		req.Header.Set("X-User-Id", a.UID)
+	req.Header.Set("X-Request-ID", deriveIDSnapshot(s, "req")+fmt.Sprintf("%d", time.Now().UnixNano()%1e6))
+	if s.UID != "" {
+		req.Header.Set("X-User-Id", s.UID)
 	}
 	_, err = c.doJSON(req)
 	return err
@@ -207,25 +212,26 @@ func DesktopChatSequence(conversationID, requestID, messageID, modelID, modelNam
 // 和品主题 resource_key 为 "theme-tkmw7j"，浅色 "light"、深色 "dark"）。纯 API set 不计
 // Hp_Appearance 分（需客户端切主题后真实活跃），保留供调色/还原与后续验证用。
 func (c *Client) SetAppearanceTheme(a *auth.Auth, resourceKey string) error {
-	if err := requireCNGamification(a); err != nil {
-		return err
+	s := a.Snapshot()
+	if a == nil || s.Site != auth.SiteCN {
+		return errCNGamificationOnly
 	}
 	body := map[string]string{"kind": "theme", "resource_key": resourceKey}
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPost, c.desktopBase(a)+desktopAppearanceSet, bytes.NewReader(raw))
+	req, err := http.NewRequest(http.MethodPost, c.chatBaseSnapshot(s)+desktopAppearanceSet, bytes.NewReader(raw))
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+s.AccessToken)
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
 	req.Header.Set("User-Agent", desktopUA)
 	req.Header.Set("X-Product", "SaaS")
-	if a.UID != "" {
-		req.Header.Set("X-User-Id", a.UID)
+	if s.UID != "" {
+		req.Header.Set("X-User-Id", s.UID)
 	}
 	_, err = c.doJSON(req)
 	return err
@@ -270,16 +276,17 @@ func DesktopAutomationCreateEvent(name string) DesktopEvent {
 // 与桌面指纹（copilot 域）不同：web 域事件是浏览器形状（os/machineId/userAgent），
 // 用于 Library_read 等页面行为类任务（实测 library_doc_intro_click 4 秒点亮）。
 func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, elementName string) error {
-	if err := requireCNGamification(a); err != nil {
-		return err
+	s := a.Snapshot()
+	if a == nil || s.Site != auth.SiteCN {
+		return errCNGamificationOnly
 	}
 	ua := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
 	ev := map[string]any{
 		"eventCode": eventCode, "timestamp": time.Now().UnixMilli(), "reportDelay": 0,
 		"pageURL": pageURL, "elementId": elementID, "elementName": elementName,
 		"os": "Win32", "arch": "", "osVersion": "10.0", "userAgent": ua,
-		"machineId": deriveID(a, "webmachine"), "userId": a.UID,
-		"userNickname": a.Nickname, "enterpriseId": a.EnterpriseID,
+		"machineId": deriveIDSnapshot(s, "webmachine"), "userId": s.UID,
+		"userNickname": s.Nickname, "enterpriseId": s.EnterpriseID,
 	}
 	raw, err := json.Marshal([]map[string]any{ev})
 	if err != nil {
@@ -289,15 +296,15 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+s.AccessToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("x-client-platform", "web")
 	req.Header.Set("Origin", c.WebBaseCN)
 	req.Header.Set("Referer", pageURL)
 	req.Header.Set("User-Agent", ua)
-	if a.UID != "" {
-		req.Header.Set("X-User-Id", a.UID)
+	if s.UID != "" {
+		req.Header.Set("X-User-Id", s.UID)
 	}
 	_, err = c.doJSON(req)
 	return err
@@ -388,8 +395,9 @@ type MarketExpert struct {
 // MarketExpertList 拉取专家市场真实专家列表（expertType: "agent" 单专家 / "team" 专家团）。
 // expert_actual_use 的判据校验要求 id 是平台上真实存在的专家（编造 id 不计数）。
 func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpert, error) {
-	if err := requireCNGamification(a); err != nil {
-		return nil, err
+	s := a.Snapshot()
+	if a == nil || s.Site != auth.SiteCN {
+		return nil, errCNGamificationOnly
 	}
 	body := map[string]any{"page": 1, "page_size": 20, "sort_by": "reco_rank", "sort_order": "desc"}
 	if expertType != "" {
@@ -399,17 +407,17 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequest(http.MethodPost, c.chatBase(a)+"/portal/operation-platform/market/expert/list", bytes.NewReader(raw))
+	req, err := http.NewRequest(http.MethodPost, c.chatBaseSnapshot(s)+"/portal/operation-platform/market/expert/list", bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+s.AccessToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", desktopUA)
-	req.Header.Set("X-Domain", c.chatBase(a))
+	req.Header.Set("X-Domain", c.chatBaseSnapshot(s))
 	req.Header.Set("X-Product", "SaaS")
-	if a.UID != "" {
-		req.Header.Set("X-User-Id", a.UID)
+	if s.UID != "" {
+		req.Header.Set("X-User-Id", s.UID)
 	}
 	var out struct {
 		Experts []MarketExpert `json:"experts"`
@@ -429,8 +437,9 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 // expert_actual_use 等 JOIN 事件的 requestId 必须是该服务端 id——自造 UUID 不计数
 // （客户端 resolveRealRequestId 同款语义，Sunny row 2113 实证）。
 func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversationID, requestID string, err error) {
-	if err := requireCNGamification(a); err != nil {
-		return "", "", err
+	s := a.Snapshot()
+	if a == nil || s.Site != auth.SiteCN {
+		return "", "", errCNGamificationOnly
 	}
 	conversationID = fmt.Sprintf("wb2api-conv-%d", time.Now().UnixNano())
 	body := map[string]any{
@@ -448,18 +457,18 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	if err != nil {
 		return "", "", err
 	}
-	req, err := http.NewRequest(http.MethodPost, c.chatBase(a)+"/v2/chat/completions", bytes.NewReader(raw))
+	req, err := http.NewRequest(http.MethodPost, c.chatBaseSnapshot(s)+"/v2/chat/completions", bytes.NewReader(raw))
 	if err != nil {
 		return "", "", err
 	}
 	h := req.Header
-	h.Set("Authorization", "Bearer "+a.AccessToken)
+	h.Set("Authorization", "Bearer "+s.AccessToken)
 	h.Set("Content-Type", "application/json")
 	h.Set("Accept", "text/event-stream")
 	h.Set("User-Agent", desktopUA)
-	h.Set("X-Domain", c.chatBase(a))
+	h.Set("X-Domain", c.chatBaseSnapshot(s))
 	h.Set("X-Product", "SaaS")
-	h.Set("X-User-Id", a.UID)
+	h.Set("X-User-Id", s.UID)
 	h.Set("X-Conversation-ID", conversationID)
 	h.Set("X-Request-ID", fmt.Sprintf("%d", time.Now().UnixNano()))
 	h.Set("X-Agent-Intent", "craft")
@@ -473,9 +482,7 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	}
 	if os.Getenv("WB2A_DEBUG_CHAT") != "" {
 		fmt.Printf("[dbg] URL=%s\n", req.URL)
-		for k := range req.Header {
-			fmt.Printf("[dbg] %s: %s\n", k, req.Header.Get(k))
-		}
+		fmt.Printf("[dbg] request headers omitted\n")
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {

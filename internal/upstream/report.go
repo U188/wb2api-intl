@@ -24,7 +24,10 @@ const reportPath = "/v2/report"
 // 与 travel.go 的 growthJSON 对称（growth 域走 chatBase + BillingHeaders；billing 域走 billingBase）。
 // report/checkin 等 billing 端点共用：请求头统一 BillingHeaders，信封与错误语义同 doJSON。
 func (c *Client) billingJSON(a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
-	s := a.Snapshot()
+	return c.billingJSONSnapshot(a.Snapshot(), method, path, body)
+}
+
+func (c *Client) billingJSONSnapshot(s auth.Snapshot, method, path string, body any) (json.RawMessage, error) {
 	var rdr io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
@@ -46,7 +49,7 @@ func (c *Client) billingJSON(a *auth.Auth, method, path string, body any) (json.
 }
 
 // chatRequestEvent 客户端 chat_request_send 事件完整形状（与 probe_active.py chat_event 对齐）。
-// userId 为必填字段（= a.UID）；conversationId 由调用方生成，无需真实会话。
+// userId 为必填字段（= s.UID）；conversationId 由调用方生成，无需真实会话。
 type chatRequestEvent struct {
 	EventCode             string `json:"eventCode"`
 	Timestamp             int64  `json:"timestamp"`
@@ -97,8 +100,9 @@ func (c *Client) ReportChatActivity(a *auth.Auth, conversationID, requestID stri
 // ReportChatActivityModel 同上，但可指定上报携带的模型：供「体验某模型」类任务
 // 对齐实际模型（如 Model_chat_GLM5.2 需 requestModelId=glm-5.2 与独立 requestID）。
 func (c *Client) ReportChatActivityModel(a *auth.Auth, conversationID, requestID, modelID, modelName string) error {
-	if err := requireCNGamification(a); err != nil {
-		return err
+	s := a.Snapshot()
+	if a == nil || s.Site != auth.SiteCN {
+		return errCNGamificationOnly
 	}
 	if requestID == "" {
 		requestID = conversationID
@@ -146,12 +150,12 @@ func (c *Client) ReportChatActivityModel(a *auth.Auth, conversationID, requestID
 		ParentConversationID:  conversationID,
 		AgentName:             "default",
 		AgentType:             "conversation",
-		UserID:                a.UID,
+		UserID:                s.UID,
 	}
 	raw, err := json.Marshal([]chatRequestEvent{ev})
 	if err != nil {
 		return err
 	}
-	_, err = c.billingJSON(a, http.MethodPost, reportPath, json.RawMessage(raw))
+	_, err = c.billingJSONSnapshot(s, http.MethodPost, reportPath, json.RawMessage(raw))
 	return err
 }

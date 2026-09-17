@@ -24,6 +24,10 @@ type Pool struct {
 	breakerCooldownMax time.Duration
 	// softRateMax 软冷却指数退避的封顶（SetSoftRateMax 注入；默认 defaultSoftRateMax）。
 	softRateMax time.Duration
+	// 连败降权参数：默认 5 次 / 10 分钟，最长 2 小时。
+	degradeThreshold   int
+	degradeCooldown    time.Duration
+	degradeCooldownMax time.Duration
 	// 三因子加权调优（SetWeights 注入；默认值见 defaultIdle*）。
 	idleWeightPerHour float64
 	idleWeightMax     float64
@@ -37,7 +41,7 @@ type Pool struct {
 	persistFails int
 }
 
-// defaultBreaker* 熔断器默认参数（FreeBuff2API 参考口径）。
+// New 构建账号池；stateFp 非空时恢复状态并启动 flusher。
 func New(stateFp string) *Pool {
 	p := &Pool{
 		byUID:              map[string]*entry{},
@@ -45,6 +49,9 @@ func New(stateFp string) *Pool {
 		breakerThreshold:   defaultBreakerThreshold,
 		breakerCooldown:    defaultBreakerCooldown,
 		breakerCooldownMax: defaultBreakerCooldownMax,
+		degradeThreshold:   defaultDegradeThreshold,
+		degradeCooldown:    defaultDegradeCooldown,
+		degradeCooldownMax: defaultDegradeCooldownMax,
 		idleWeightPerHour:  defaultIdleWeightPerHour,
 		idleWeightMax:      defaultIdleWeightMax,
 	}
@@ -67,6 +74,21 @@ func (p *Pool) SetBreaker(threshold int, cooldown, cooldownMax time.Duration) {
 	}
 	if cooldownMax > 0 {
 		p.breakerCooldownMax = cooldownMax
+	}
+}
+
+// SetDegrade 注入连败降权参数。仅 ErrClient/传输失败等无权威处罚路径调用 NoteFailures。
+func (p *Pool) SetDegrade(threshold int, cooldown, cooldownMax time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if threshold > 0 {
+		p.degradeThreshold = threshold
+	}
+	if cooldown > 0 {
+		p.degradeCooldown = cooldown
+	}
+	if cooldownMax > 0 {
+		p.degradeCooldownMax = cooldownMax
 	}
 }
 

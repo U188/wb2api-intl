@@ -54,7 +54,10 @@
     "breaker_cooldown": "30m",
     "breaker_cooldown_max": "6h",
     "idle_weight_per_hour": 0.5,
-    "idle_weight_max": 5.0
+    "idle_weight_max": 5.0,
+    "degrade_threshold": 5,
+    "degrade_cooldown": "10m",
+    "degrade_cooldown_max": "2h"
   },
   "session_sticky": {
     "enabled": true,

@@ -138,17 +138,18 @@ func (c *Client) AcceptTasks(a *auth.Auth, taskCodes []string) error {
 // 一直返回 400 "task not completed"，是此前领奖失败的真实原因。
 // 本实现返回 (credit, energy, err)：credit/energy 为本次到账奖励（已领取过时为 0）。
 func (c *Client) ClaimReward(a *auth.Auth, taskCode string) (credit, energy int64, err error) {
-	if err := requireCNGamification(a); err != nil {
-		return 0, 0, err
+	s := a.Snapshot()
+	if a == nil || s.Site != auth.SiteCN {
+		return 0, 0, errCNGamificationOnly
 	}
 	req, err := http.NewRequest(http.MethodPost,
-		c.webBase(a)+"/activity/growth/tasks/"+url.PathEscape(taskCode)+"/claim", nil)
+		c.webBaseSnapshot(s)+"/activity/growth/tasks/"+url.PathEscape(taskCode)+"/claim", nil)
 	if err != nil {
 		return 0, 0, err
 	}
 	// Web 端请求头形状（对照浏览器实际请求）：Origin/Referer 指向 workbuddy.cn 成长中心，
 	// 带 x-client-platform: web 标记来源端。
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+s.AccessToken)
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", "https://www.workbuddy.cn")
@@ -157,15 +158,15 @@ func (c *Client) ClaimReward(a *auth.Auth, taskCode string) (credit, energy int6
 	if ua := c.userAgent(); ua != "" {
 		req.Header.Set("User-Agent", ua)
 	}
-	if a.UID != "" {
-		req.Header.Set("X-User-Id", a.UID)
+	if s.UID != "" {
+		req.Header.Set("X-User-Id", s.UID)
 	}
-	if a.EnterpriseID != "" {
-		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
-		req.Header.Set("X-Tenant-Id", a.EnterpriseID)
+	if s.EnterpriseID != "" {
+		req.Header.Set("X-Enterprise-Id", s.EnterpriseID)
+		req.Header.Set("X-Tenant-Id", s.EnterpriseID)
 	}
-	if a.Domain != "" {
-		req.Header.Set("X-Domain", a.Domain)
+	if s.Domain != "" {
+		req.Header.Set("X-Domain", s.Domain)
 	}
 
 	data, err := c.doJSON(req)

@@ -105,6 +105,7 @@ func (p *Pool) load() {
 // applyAccountsLocked 用持久化账号状态覆盖/插入 byUID（placeholder 凭证，Add 时换全）。
 // 本地 load() 与 Redis 快照恢复共用；调用方必须已持有 p.mu。
 func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
+	now := time.Now()
 	for uid, s := range accounts {
 		// err_total 优先；旧文件的 err_count（连续错误）作一次性迁移源映射进来（二者取较大者，
 		// 尽最大可能保留历史观测信号——旧语义下 err_count 也真实发生过错误，不应丢）。
@@ -112,20 +113,29 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 		if int64(s.ErrCount) > errTotal {
 			errTotal = int64(s.ErrCount)
 		}
+		degradeUntil, consecutiveFails := s.DegradeUntil, s.ConsecutiveFails
+		if !degradeUntil.IsZero() && !now.Before(degradeUntil) {
+			degradeUntil, consecutiveFails = time.Time{}, 0
+		}
+		if consecutiveFails < 0 {
+			consecutiveFails = 0
+		}
 		p.byUID[uid] = &entry{
-			a:            &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
-			credits:      s.Credits,
-			creditsTotal: s.CreditsTotal,
-			disabled:     s.Disabled,
-			reason:       s.Reason,
-			until:        s.Until,
-			coolKind:     s.CoolKind,
-			successCount: s.SuccessCount,
-			errTotal:     errTotal,
-			lastErr:      s.LastErr,
-			lastSuccess:  s.LastSuccess,
-			tokenUsage:   s.TokenUsage,
-			softStreak:   s.SoftStreak,
+			a:                &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
+			credits:          s.Credits,
+			creditsTotal:     s.CreditsTotal,
+			disabled:         s.Disabled,
+			reason:           s.Reason,
+			until:            s.Until,
+			coolKind:         s.CoolKind,
+			successCount:     s.SuccessCount,
+			errTotal:         errTotal,
+			lastErr:          s.LastErr,
+			lastSuccess:      s.LastSuccess,
+			tokenUsage:       s.TokenUsage,
+			softStreak:       s.SoftStreak,
+			consecutiveFails: consecutiveFails,
+			degradeUntil:     degradeUntil,
 		}
 	}
 }
@@ -188,20 +198,27 @@ func (p *Pool) notePersistFail(err error) {
 // stateOverviewLocked 收集当前内存状态为 stateFile（供落盘 + 快照镜像复用）。调用方必须已持 p.mu。
 func (p *Pool) stateOverviewLocked() stateFile {
 	sf := stateFile{Accounts: map[string]stateAccount{}}
+	now := time.Now()
 	for uid, e := range p.byUID {
+		degradeUntil, consecutiveFails := e.degradeUntil, e.consecutiveFails
+		if !degradeUntil.IsZero() && !now.Before(degradeUntil) {
+			degradeUntil, consecutiveFails = time.Time{}, 0
+		}
 		sf.Accounts[uid] = stateAccount{
-			Credits:      e.credits,
-			CreditsTotal: e.creditsTotal,
-			Disabled:     e.disabled,
-			Reason:       e.reason,
-			Until:        e.until,
-			CoolKind:     e.coolKind,
-			SuccessCount: e.successCount,
-			ErrTotal:     e.errTotal,
-			LastSuccess:  e.lastSuccess,
-			LastErr:      e.lastErr,
-			TokenUsage:   e.tokenUsage,
-			SoftStreak:   e.softStreak,
+			Credits:          e.credits,
+			CreditsTotal:     e.creditsTotal,
+			Disabled:         e.disabled,
+			Reason:           e.reason,
+			Until:            e.until,
+			CoolKind:         e.coolKind,
+			SuccessCount:     e.successCount,
+			ErrTotal:         e.errTotal,
+			LastSuccess:      e.lastSuccess,
+			LastErr:          e.lastErr,
+			TokenUsage:       e.tokenUsage,
+			SoftStreak:       e.softStreak,
+			ConsecutiveFails: consecutiveFails,
+			DegradeUntil:     degradeUntil,
 		}
 	}
 	return sf

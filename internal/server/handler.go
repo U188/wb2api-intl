@@ -534,6 +534,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, site s
 			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
 			lastErr = terr
 			fail(acct.UID)
+			h.cfg.Pool.NoteFailures(acct.UID)
 			if !sleepCtx(r.Context(), backoffAfter(i)) {
 				if r.Context().Err() == nil {
 					writeOpenAIError(w, http.StatusServiceUnavailable, "retry_cancelled", "上游重试已取消")
@@ -563,6 +564,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, site s
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 			h.applyErrorPolicy(acct.UID, kind, string(respBody), peek.Model)
 			fail(acct.UID)
+			if kind == upstream.ErrClient || kind == upstream.ErrNone {
+				h.cfg.Pool.NoteFailures(acct.UID)
+			}
 			// WAF 403 在同一站点短窗内命中多个不同账号，说明出口 IP 被拦；停止换号，
 			// 避免把一个请求放大为 MaxRotate 次。CN/INTL 使用独立 gate。
 			if kind == upstream.ErrWafBlock && h.waf.forSite(site).note(acct.UID, time.Now()) {

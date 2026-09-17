@@ -24,7 +24,7 @@ import (
 var errCNGamificationOnly = errors.New("gamification is only available for cn accounts")
 
 func requireCNGamification(a *auth.Auth) error {
-	if a == nil || auth.SiteFrom(a.Site) != auth.SiteCN {
+	if a == nil || a.Snapshot().Site != auth.SiteCN {
 		return errCNGamificationOnly
 	}
 	return nil
@@ -372,8 +372,10 @@ func accountSite(a *auth.Auth) string {
 	return a.Snapshot().Site
 }
 
-func (c *Client) chatBase(a *auth.Auth) string {
-	if accountSite(a) == auth.SiteIntl && c.ChatBaseIntl != "" {
+func (c *Client) chatBase(a *auth.Auth) string { return c.chatBaseSnapshot(a.Snapshot()) }
+
+func (c *Client) chatBaseSnapshot(s auth.Snapshot) string {
+	if s.Site == auth.SiteIntl && c.ChatBaseIntl != "" {
 		return c.ChatBaseIntl
 	}
 	return c.ChatBaseCN
@@ -424,8 +426,10 @@ func (c *Client) billingBase(a *auth.Auth) string {
 
 // webBase 返回官网域（任务领奖类接口；未注入时回落默认）。
 // 按账号站点分发：国际版无成长任务，实际不会走到；此处统一回落各站默认。
-func (c *Client) webBase(a *auth.Auth) string {
-	if accountSite(a) == auth.SiteIntl {
+func (c *Client) webBase(a *auth.Auth) string { return c.webBaseSnapshot(a.Snapshot()) }
+
+func (c *Client) webBaseSnapshot(s auth.Snapshot) string {
+	if s.Site == auth.SiteIntl {
 		if c.BillingBaseIntl != "" {
 			return c.BillingBaseIntl
 		}
@@ -470,14 +474,25 @@ func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
 	return env.Data, nil
 }
 
-// RefreshToken 刷新 access token；网络请求在锁外执行，避免一个慢 RPC 把同账号
-// 的 chat / billing / SaveAtomic 读全部堵住。并发刷新时用原 refreshToken 作版本号：
-// 已有别的刷新完成则不覆盖其新凭证；错误也以已完成的并发刷新为成功。
+// RefreshToken serializes refreshes per Auth, not snapshots or other requests.
+// Only a generation change for the same identity is reusable as a successful refresh.
 func (c *Client) RefreshToken(a *auth.Auth) error {
 	if a == nil {
 		return fmt.Errorf("nil auth")
 	}
+	before := a.Snapshot()
+	a.LockRefresh()
+	defer a.UnlockRefresh()
 	s := a.Snapshot()
+	if !sameRefreshIdentity(before, s) {
+		return fmt.Errorf("refresh skipped: account identity changed")
+	}
+	if s.Generation != before.Generation {
+		return nil
+	}
+	if !sameRefreshCredentials(before, s) {
+		return fmt.Errorf("refresh skipped: credentials changed")
+	}
 	if strings.TrimSpace(s.RefreshToken) == "" {
 		return fmt.Errorf("no refreshToken")
 	}
@@ -492,10 +507,7 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	c.refreshHeadersSnapshot(req, s)
 	data, err := c.doJSON(req)
 	if err != nil {
-		if a.Snapshot().RefreshToken != s.RefreshToken {
-			return nil // 并发刷新已经成功，旧请求的错误不影响新凭证。
-		}
-		return err
+		return refreshResult(a.Snapshot(), s, err)
 	}
 	var tok struct {
 		AccessToken  string `json:"accessToken"`
@@ -503,17 +515,20 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 		ExpiresIn    int64  `json:"expiresIn"`
 		Domain       string `json:"domain"`
 	}
-	if err := json.Unmarshal(data, &tok); err != nil || tok.AccessToken == "" {
-		if a.Snapshot().RefreshToken != s.RefreshToken {
-			return nil
-		}
-		return fmt.Errorf("refresh_failed: no accessToken in response — re-login required")
+	if json.Unmarshal(data, &tok) != nil || tok.AccessToken == "" {
+		return refreshResult(a.Snapshot(), s, fmt.Errorf("refresh_failed: no accessToken in response — re-login required"))
 	}
 	a.Lock()
 	defer a.Unlock()
-	if a.Generation != s.Generation || a.RefreshToken != s.RefreshToken || a.AccessToken != s.AccessToken ||
-		a.UID != s.UID || auth.SiteFrom(a.Site) != s.Site || a.FilePath != s.FilePath {
-		return nil // 已被另一轮刷新/热加载取代，不能用旧响应覆盖。
+	current := a.SnapshotLocked()
+	if !sameRefreshIdentity(s, current) {
+		return fmt.Errorf("refresh skipped: account identity changed")
+	}
+	if current.Generation != s.Generation {
+		return nil
+	}
+	if !sameRefreshCredentials(s, current) {
+		return fmt.Errorf("refresh skipped: credentials changed")
 	}
 	a.AccessToken = tok.AccessToken
 	a.Generation++
@@ -523,17 +538,43 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	if tok.Domain != "" {
 		a.Domain = tok.Domain
 	}
-	// preserveExpiry：响应缺 expiresIn 时保留旧过期时间，避免刷新风暴。
 	if tok.ExpiresIn > 0 {
 		a.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
 	}
 	return nil
 }
 
+func sameRefreshIdentity(x, y auth.Snapshot) bool {
+	return x.Site == y.Site && x.UID == y.UID && x.FilePath == y.FilePath
+}
+
+func sameRefreshCredentials(x, y auth.Snapshot) bool {
+	return x.AccessToken == y.AccessToken && x.RefreshToken == y.RefreshToken &&
+		x.Domain == y.Domain && x.ExpiresAt == y.ExpiresAt
+}
+
+func refreshResult(current, original auth.Snapshot, err error) error {
+	if !sameRefreshIdentity(current, original) {
+		return fmt.Errorf("refresh skipped: account identity changed")
+	}
+	if current.Generation != original.Generation {
+		return nil
+	}
+	if !sameRefreshCredentials(current, original) {
+		return fmt.Errorf("refresh skipped: credentials changed")
+	}
+	return err
+}
+
 // ChatStream 发 chat 请求并返回原始 SSE body 流（调用方负责 Close）。
 // 非 2xx 时 rc 为 nil、body 为上游响应体（供调用方 Classify(status, string(body))）、err 为 nil；
 // 只有传输层失败才返回 err。
-func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string) (rc io.ReadCloser, status int, respBody []byte, err error) {
+func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string) (io.ReadCloser, int, []byte, error) {
+	return c.ChatStreamContext(context.Background(), a, body, clientIP)
+}
+
+// ChatStreamContext binds the upstream stream to the caller's lifetime.
+func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byte, clientIP string) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	s := a.Snapshot()
 	urlBase := c.ChatBaseCN
 	if auth.SiteFrom(s.Site) == auth.SiteIntl && c.ChatBaseIntl != "" {
@@ -541,17 +582,17 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string) (rc io.R
 	}
 	url := urlBase + "/v2/chat/completions"
 	out := c.prepareBodySnapshot(s, body)
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(out))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(out))
 	if err != nil {
 		return nil, 0, nil, err
 	}
 	c.chatHeadersSnapshot(req, s, clientIP)
-	ctx, cancel := context.WithCancel(context.Background())
-	req = req.WithContext(ctx)
+	streamCtx, cancel := context.WithCancel(req.Context())
+	req = req.WithContext(streamCtx)
 	resp, err := c.chatHTTP().Do(req)
 	if err != nil {
 		cancel()
-		log.Printf("chat_stream uid=%s: transport error: %v", a.UID, err)
+		log.Printf("chat_stream uid=%s: transport error", s.UID)
 		return nil, 0, nil, err
 	}
 	if resp.StatusCode >= 400 {
@@ -559,14 +600,21 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string) (rc io.R
 		resp.Body.Close()
 		cancel()
 		kind := Classify(resp.StatusCode, string(raw))
-		log.Printf("chat_stream uid=%s: upstream %d %s body=%s",
-			a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
+		log.Printf("chat_stream uid=%s: upstream %d %s", s.UID, resp.StatusCode, kind)
 		return nil, resp.StatusCode, raw, nil
 	}
-	// 成功分支：cancel 所有权交给 monitorBody（其 Close 会 cancel）；
-	// IdleTimeout<=0 时 monitorBody 原样返回底流、无人调 cancel——可接受：
-	// ctx 无 deadline 无 goroutine，连接由 resp.Body.Close 正常清理。
-	return monitorBody(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
+	// Closing the returned body always releases the derived request context.
+	return &cancelOnClose{ReadCloser: monitorBody(resp.Body, c.IdleTimeout, cancel), cancel: cancel}, resp.StatusCode, nil, nil
+}
+
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *cancelOnClose) Close() error {
+	b.cancel()
+	return b.ReadCloser.Close()
 }
 
 // ModelInfo 动态模型信息（含物理 token 上限与客户端会话上下文档位）。

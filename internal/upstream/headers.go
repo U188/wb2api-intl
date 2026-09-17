@@ -78,8 +78,8 @@ func (c *Client) billingUA() string {
 // 优先级：auth.Auth.DeviceToken（每号）> Client.DeviceToken（config 全局）> 文件兜底。
 // 三者皆空/读失败则返回空串（调用方不注入该头，优雅降级）。
 func (c *Client) resolveDeviceToken(a *auth.Auth) string {
-	if a != nil && a.DeviceToken != "" {
-		return a.DeviceToken
+	if a != nil {
+		return c.resolveDeviceTokenSnapshot(a.Snapshot())
 	}
 	if c != nil && c.DeviceToken != "" {
 		return c.DeviceToken
@@ -232,17 +232,9 @@ func (c *Client) billingHeadersSnapshot(req *http.Request, s auth.Snapshot) {
 	c.injectDeviceTokenSnapshot(req, s)
 }
 
-// RefreshHeaders 供普通锁外调用；RefreshToken 已持锁路径使用 refreshHeadersLocked，
-// 避免不可重入 Mutex 的二次加锁。
+// RefreshHeaders builds the refresh headers from one immutable snapshot.
 func (c *Client) RefreshHeaders(req *http.Request, a *auth.Auth) {
 	c.refreshHeadersSnapshot(req, a.Snapshot())
-}
-
-func (c *Client) refreshHeadersLocked(req *http.Request, a *auth.Auth) {
-	c.refreshHeadersSnapshot(req, auth.Snapshot{
-		AccessToken: a.AccessToken, RefreshToken: a.RefreshToken, EnterpriseID: a.EnterpriseID,
-		Domain: a.Domain, UID: a.UID, Site: auth.SiteFrom(a.Site), DeviceToken: a.DeviceToken,
-	})
 }
 
 func (c *Client) refreshHeadersSnapshot(req *http.Request, s auth.Snapshot) {

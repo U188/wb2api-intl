@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
@@ -834,5 +835,78 @@ func TestLoadConfigPathIsDirectory(t *testing.T) {
 	}
 	if !strings.Contains(msg, "config.example.json") {
 		t.Errorf("error should suggest the fix (cp config.example.json): %v", err)
+	}
+}
+
+func TestDegradeConfigBoundaries(t *testing.T) {
+	for _, raw := range []string{`{}`, `{"pool":{"degrade_threshold":0,"degrade_cooldown":"","degrade_cooldown_max":""}}`, `{"pool":{"degrade_threshold":-1}}`} {
+		c, err := ParseConfig([]byte(raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.Pool.DegradeThreshold != 5 || c.DegradeCooldownDur != 10*time.Minute || c.DegradeCooldownMaxD != 2*time.Hour {
+			t.Fatalf("unexpected defaults: %+v", c.Pool)
+		}
+	}
+	for _, field := range []string{"degrade_cooldown", "degrade_cooldown_max"} {
+		for _, value := range []string{"oops", "0s", "-1m", "999999999999999999h"} {
+			raw, _ := json.Marshal(map[string]any{"pool": map[string]any{field: value}})
+			if _, err := ParseConfig(raw); err == nil || !strings.Contains(err.Error(), "pool."+field) {
+				t.Fatalf("%s=%q should fail with field error: %v", field, value, err)
+			}
+		}
+	}
+}
+
+func TestSaveConfigHotAppliesDegradeAndRejectsInvalid(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u"})
+	live := livecfg.New(livecfg.Snapshot{})
+	up := upstream.New()
+	sch := scheduler.New(scheduler.Config{Pool: p, Upstream: up})
+	fields, err := saveConfig([]byte(`{"pool":{"degrade_threshold":2,"degrade_cooldown":"3h","degrade_cooldown_max":"1h"}}`), path, live, p, up, sch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range fields {
+		if strings.Contains(f, "degrade") {
+			t.Fatal("degrade should not require restart")
+		}
+	}
+	p.NoteFailures("u")
+	if st, _ := p.Status("u"); st.Cooling {
+		t.Fatal("threshold hot update ignored")
+	}
+	p.NoteFailures("u")
+	st, _ := p.Status("u")
+	if !st.Cooling || time.Until(st.DegradeUntil) > time.Hour || time.Until(st.DegradeUntil) < 59*time.Minute {
+		t.Fatalf("cooldown/cap not applied: %+v", st)
+	}
+	before, _ := os.ReadFile(path)
+	if _, err := saveConfig([]byte(`{"pool":{"degrade_cooldown":"0s"}}`), path, live, p, up, sch); err == nil {
+		t.Fatal("invalid save accepted")
+	}
+	after, _ := os.ReadFile(path)
+	if string(before) != string(after) {
+		t.Fatal("invalid save changed disk")
+	}
+	if _, err := saveConfig([]byte(`{"pool":{"degrade_threshold":0,"degrade_cooldown":"","degrade_cooldown_max":""}}`), path, live, p, up, sch); err != nil {
+		t.Fatal(err)
+	}
+	p.Revive("u")
+	for i := 0; i < 4; i++ {
+		p.NoteFailures("u")
+	}
+	if st, _ := p.Status("u"); st.Cooling {
+		t.Fatal("default reset retained old threshold")
+	}
+	p.NoteFailures("u")
+	st, _ = p.Status("u")
+	if time.Until(st.DegradeUntil) > 10*time.Minute || time.Until(st.DegradeUntil) < 9*time.Minute {
+		t.Fatal("default reset retained old cooldown")
 	}
 }

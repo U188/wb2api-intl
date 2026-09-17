@@ -44,8 +44,9 @@ type TravelState struct {
 // growthJSON 发 growth 域请求并解信封；body 为 nil 时不带请求体。
 // 错误语义与 doJSON 一致：HTTP 非 2xx / 业务 code != 0 → *Error。
 func (c *Client) growthJSON(a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
-	if err := requireCNGamification(a); err != nil {
-		return nil, err
+	s := a.Snapshot()
+	if a == nil || s.Site != auth.SiteCN {
+		return nil, errCNGamificationOnly
 	}
 	var rdr io.Reader
 	if body != nil {
@@ -55,11 +56,15 @@ func (c *Client) growthJSON(a *auth.Auth, method, path string, body any) (json.R
 		}
 		rdr = bytes.NewReader(raw)
 	}
-	req, err := http.NewRequest(method, c.chatBase(a)+path, rdr)
+	base := c.ChatBaseCN
+	if s.Site == auth.SiteIntl && c.ChatBaseIntl != "" {
+		base = c.ChatBaseIntl
+	}
+	req, err := http.NewRequest(method, base+path, rdr)
 	if err != nil {
 		return nil, err
 	}
-	c.BillingHeaders(req, a)
+	c.billingHeadersSnapshot(req, s)
 	return c.doJSON(req)
 }
 

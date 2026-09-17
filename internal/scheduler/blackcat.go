@@ -22,15 +22,16 @@ func (s *Scheduler) RunBlackcatNow() {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.AccessToken == "" {
+		snap := a.Snapshot()
+		if a == nil || snap.AccessToken == "" {
 			continue
 		}
-		if a.Site == auth.SiteIntl {
+		if snap.Site == auth.SiteIntl {
 			continue // 夜猫子补足（growth 对话任务）是国内版体系，国际版无
 		}
 		need, err := s.cfg.Upstream.BlackcatNeed(a)
 		if err != nil {
-			log.Printf("blackcat %s: %v", a.UID, err)
+			log.Printf("blackcat %s: %v", a.Snapshot().UID, err)
 			continue
 		}
 		if need <= 0 {
@@ -38,10 +39,10 @@ func (s *Scheduler) RunBlackcatNow() {
 		}
 		ok, err := s.cfg.Upstream.RunNightChats(a, int(need))
 		if err != nil {
-			log.Printf("blackcat %s: %d/%d 完成，中断: %v", a.UID, ok, need, err)
+			log.Printf("blackcat %s: %d/%d 完成，中断: %v", a.Snapshot().UID, ok, need, err)
 			continue
 		}
-		log.Printf("blackcat %s: 完成 %d 次夜间对话", a.UID, ok)
+		log.Printf("blackcat %s: 完成 %d 次夜间对话", a.Snapshot().UID, ok)
 		time.Sleep(activityAccountDelay)
 	}
 }

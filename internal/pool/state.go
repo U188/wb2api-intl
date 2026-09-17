@@ -63,10 +63,12 @@ func (p *Pool) ClearSessionDead(uid string) {
 func (p *Pool) ReviveDisabled(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok && e.disabled {
+	if e, ok := p.byUID[uid]; ok {
 		e.disabled = false
 		e.reason = ""
 		e.sessionDeadFails = 0
+		e.consecutiveFails = 0
+		e.degradeUntil = time.Time{}
 		p.dirty.Store(true)
 	}
 }
@@ -92,6 +94,8 @@ func (p *Pool) Revive(uid string) bool {
 	e.fails = 0
 	e.retryCount = 0
 	e.breakerUntil = time.Time{}
+	e.consecutiveFails = 0
+	e.degradeUntil = time.Time{}
 	p.dirty.Store(true)
 	return true
 }
@@ -144,6 +148,8 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.breakerUntil = time.Time{}
 		e.softStreak = 0
 		e.sessionDeadFails = 0
+		e.consecutiveFails = 0
+		e.degradeUntil = time.Time{}
 		p.dirty.Store(true)
 	}
 }
@@ -332,7 +338,7 @@ func (p *Pool) ServableNowForSite(site string) bool {
 		if p.inFlightFull(e) {
 			continue
 		}
-		if e.healthy(now) || e.modelExempt() {
+		if e.healthy(now) || (e.modelExempt() && !now.Before(e.degradeUntil)) {
 			return true
 		}
 	}
@@ -362,7 +368,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Site:            e.a.Site,
 		Credits:         e.credits,
 		CreditsTotal:    e.creditsTotal,
-		Cooling:         now.Before(e.until) || now.Before(e.breakerUntil),
+		Cooling:         now.Before(e.until) || now.Before(e.breakerUntil) || now.Before(e.degradeUntil),
 		Reason:          e.reason,
 		Disabled:        e.disabled,
 		SuccessCount:    e.successCount,
@@ -375,6 +381,8 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		InFlight:        int(e.inFlight.Load()),
 		BreakerFails:    e.fails,
 		BreakerUntil:    e.breakerUntil,
+		DegradeFails:    e.consecutiveFails,
+		DegradeUntil:    e.degradeUntil,
 	}
 	if st.Disabled {
 		// 禁用账号透出禁用原因（运维看不到为什么死）。
@@ -382,11 +390,15 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 	}
 	if st.Cooling {
 		// 冷却剩余秒数（向上取整，避免 0 显示为已到期）。
-		st.CoolRemaining = int64(time.Until(e.until).Seconds() + 0.999)
-		if st.CoolRemaining < 0 {
-			st.CoolRemaining = 0
+		// 保留既有冷却字段语义；仅连败降权作为唯一处罚时使用其截止。
+		if now.Before(e.until) {
+			st.CoolRemaining = int64(e.until.Sub(now).Seconds() + 0.999)
+			st.CoolKind = e.coolKind.String()
+		} else if now.Before(e.degradeUntil) && !now.Before(e.breakerUntil) {
+			st.Until = e.degradeUntil
+			st.CoolRemaining = int64(e.degradeUntil.Sub(now).Seconds() + 0.999)
+			st.CoolKind = "degrade"
 		}
-		st.CoolKind = e.coolKind.String()
 	}
 	return st
 }
