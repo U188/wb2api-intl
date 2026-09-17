@@ -67,6 +67,20 @@ func TestClassify(t *testing.T) {
 	}
 }
 
+func TestClassifyWAFBlock(t *testing.T) {
+	for _, body := range []string{"", "<html>Access denied</html>", "forbidden by APISIX"} {
+		if got := Classify(http.StatusForbidden, body); got != ErrWafBlock {
+			t.Errorf("Classify(403,%q)=%v want waf_block", body, got)
+		}
+	}
+	// 合法 JSON 业务信封即使字段周围有空白，也不能误判为 WAF。
+	for _, body := range []string{`{"code":11140,"msg":"request illegal"}`, `{ "code" : 11140, "msg" : "request illegal" }`} {
+		if got := Classify(http.StatusForbidden, body); got == ErrWafBlock {
+			t.Fatalf("business envelope %q misclassified as WAF: %v", body, got)
+		}
+	}
+}
+
 // TestIsModelRateLimit 判断 429 body 是否明确指向模型级限流（code 6004）。
 func TestIsModelRateLimit(t *testing.T) {
 	cases := []struct {

@@ -93,6 +93,7 @@ type Handler struct {
 	cfg     Config
 	mux     *http.ServeMux
 	degrade degradeGate
+	waf     siteWAFGates
 }
 
 // NewHandler 构建 handler。
@@ -464,6 +465,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, site s
 		body = prompt.Rewrite(body, prompt.Degraded)
 		degradedApplied = true
 	}
+	// 站点级 WAF gate 激活期间，同站新请求直接 fail-fast，避免继续消耗账号池；
+	// CN/INTL gate 独立，另一通道不受影响。
+	if h.waf.forSite(site).active(time.Now()) {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "waf_ip_blocked",
+			"上游正在阻止该站点的网关出口 IP，请稍后重试")
+		st.status = http.StatusServiceUnavailable
+		return
+	}
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUID 已校验 health + 在途未满），否则普通轮换。
@@ -523,9 +532,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, site s
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
 			// 上游 client 已打 transport error 日志。
 			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
-			st.status = http.StatusServiceUnavailable
 			lastErr = terr
 			fail(acct.UID)
+			if !sleepCtx(r.Context(), backoffAfter(i)) {
+				if r.Context().Err() == nil {
+					writeOpenAIError(w, http.StatusServiceUnavailable, "retry_cancelled", "上游重试已取消")
+					st.status = http.StatusServiceUnavailable
+				}
+				return
+			}
 			continue
 		}
 		if status >= 400 {
@@ -548,6 +563,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, site s
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 			h.applyErrorPolicy(acct.UID, kind, string(respBody), peek.Model)
 			fail(acct.UID)
+			// WAF 403 在同一站点短窗内命中多个不同账号，说明出口 IP 被拦；停止换号，
+			// 避免把一个请求放大为 MaxRotate 次。CN/INTL 使用独立 gate。
+			if kind == upstream.ErrWafBlock && h.waf.forSite(site).note(acct.UID, time.Now()) {
+				log.Printf("WARN: waf ip-level block site=%s, rotation stopped", site)
+				break
+			}
+			if !sleepCtx(r.Context(), backoffAfter(i)) {
+				if r.Context().Err() == nil {
+					writeOpenAIError(w, http.StatusServiceUnavailable, "retry_cancelled", "上游重试已取消")
+					st.status = http.StatusServiceUnavailable
+				}
+				return
+			}
 			continue
 		}
 		h.cfg.Pool.NoteSuccess(acct.UID)
@@ -635,22 +663,20 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 	case upstream.ErrSessionDead:
 		h.cfg.Pool.Disable(uid, "12153 session dead")
 	case upstream.ErrNotFound:
-		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：
-		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。
+		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避。
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, notFoundCooldown, "upstream 404")
 	case upstream.ErrServer:
-		// 5xx 上游故障：Classify 已把 ≥500 判为 ErrServer，在此喂熔断计数（不再手写 status>=500）。
+		// 5xx 上游故障喂熔断计数。
 		h.cfg.Pool.NoteError(uid)
+	case upstream.ErrWafBlock:
+		// WAF 多为出口 IP/指纹维频控，不永久禁号；账号短冷却，站点 gate 决定是否停轮转。
+		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, 60*time.Second, "waf 403 block")
 	case upstream.ErrContentBlocked:
-		// 内容策略拦截（误报）：内容问题非账号问题，不罚账号（无冷却/熔断/NoteError）。
-		// passthrough 模式由 chatCompletions 内降级重试处理；custom 模式本不会到此分支。
+		// 内容策略拦截：内容问题非账号问题，不罚账号；passthrough 模式走降级重试。
 	case upstream.ErrBadParams:
-		// 请求体解析失败（400 + Unmarshal chat params failed / 11101）：发给上游的 body
-		// 有问题（网关截断已由 413 消灭，剩余为客户端畸形 JSON）。换了账号照样 400，
-		// 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇）；但**仍然轮转**
-		// ——不同账号可能有不同的模型权限，值得换号再试一次。
+		// 请求体解析失败：不罚账号，仍允许不同账号的模型权限轮转。
 	default:
-		// 其余（ErrClient/ErrNone）：只换号不罚（防雪崩），不喂熔断。
+		// 其余（ErrClient/ErrNone）：只换号不罚。
 	}
 }
 

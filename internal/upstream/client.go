@@ -42,6 +42,7 @@ const (
 	ErrServer                        // 5xx 上游故障
 	ErrContentBlocked                // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
 	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 不罚账号，仍轮转
+	ErrWafBlock                      // 403 + 非业务信封体（空体/HTML）→ 账号软冷却；多号触发站点级 fail-fast
 	ErrClient                        // 其他 4xx / 业务错误
 )
 
@@ -61,6 +62,8 @@ func (k ErrKind) String() string {
 		return "content_blocked"
 	case ErrBadParams:
 		return "bad_params"
+	case ErrWafBlock:
+		return "waf_block"
 	case ErrClient:
 		return "client"
 	default:
@@ -179,6 +182,22 @@ func ParseSoftRateReset(body string) (time.Time, bool) {
 	return t, true
 }
 
+func IsWafBlocked(status int, body string) bool {
+	if status != http.StatusForbidden {
+		return false
+	}
+	var env map[string]json.RawMessage
+	if json.Unmarshal([]byte(body), &env) == nil {
+		if _, ok := env["code"]; ok {
+			return false
+		}
+		if _, ok := env["msg"]; ok {
+			return false
+		}
+	}
+	return true
+}
+
 // Classify 按 HTTP 状态码 + body 判定错误类别。
 //
 // 判定顺序自「严」到「宽」，每层的先后都有语义依据：
@@ -216,6 +235,9 @@ func Classify(status int, body string) ErrKind {
 	}
 	if status == http.StatusTooManyRequests {
 		return ErrSoftRate
+	}
+	if IsWafBlocked(status, body) {
+		return ErrWafBlock
 	}
 	if status == http.StatusNotFound {
 		return ErrNotFound
