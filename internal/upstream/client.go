@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -294,6 +295,8 @@ type Client struct {
 
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
 	SanitizeFingerprints bool
+	sanitizeConfigured   atomic.Bool
+	sanitizeFingerprints atomic.Bool
 
 	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
 	// 空 = 默认官方形态：chat/refresh/FetchModels 走
@@ -339,22 +342,35 @@ type Client struct {
 // New 生产默认值。配置连接池减少 TLS 握手。
 func New() *Client {
 	tr := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
-		// 聊天 SSE 首字节前硬上限（对短 RPC 无实际影响：其总时长 120s 更先到期）。
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		IdleConnTimeout:       90 * time.Second,
 		ResponseHeaderTimeout: 120 * time.Second,
 	}
-	return &Client{
+	c := &Client{
 		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
-		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
+		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr},
 		SanitizeFingerprints: true,
-		ChatBaseCN:           "https://copilot.tencent.com",
-		BillingBaseCN:        "https://www.codebuddy.cn",
-		WebBaseCN:            "https://www.workbuddy.cn",
-		ChatBaseIntl:         "https://www.codebuddy.ai",
-		BillingBaseIntl:      "https://www.codebuddy.ai",
+		ChatBaseCN:           "https://copilot.tencent.com", BillingBaseCN: "https://www.codebuddy.cn",
+		WebBaseCN: "https://www.workbuddy.cn", ChatBaseIntl: "https://www.codebuddy.ai",
+		BillingBaseIntl: "https://www.codebuddy.ai",
 	}
+	c.SetSanitizeFingerprints(true)
+	return c
+}
+
+// SetSanitizeFingerprints 可并发热改出站指纹脱敏开关。
+func (c *Client) SetSanitizeFingerprints(v bool) {
+	c.sanitizeFingerprints.Store(v)
+	c.sanitizeConfigured.Store(true)
+}
+
+func (c *Client) sanitizeEnabled() bool {
+	if c.sanitizeConfigured.Load() {
+		return c.sanitizeFingerprints.Load()
+	}
+	// 手工构造的测试/旧调用仍以公开字段为准。
+	return c.SanitizeFingerprints
 }
 
 // chatHTTP 返回聊天专用 client；未设置（如测试只注入 HTTP）时回落 HTTP。
@@ -387,7 +403,7 @@ func (c *Client) prepareBody(a *auth.Auth, body []byte) []byte {
 }
 
 func (c *Client) prepareBodySnapshot(s auth.Snapshot, body []byte) []byte {
-	return PrepareBodyOptWithEfforts(body, c.SanitizeFingerprints, c.effortsSnapshot(s.Site))
+	return PrepareBodyOptWithEfforts(body, c.sanitizeEnabled(), c.effortsSnapshot(s.Site))
 }
 
 // effortsSnapshot 返回指定站点 effort 能力缓存副本。国际目录是随程序内置的，

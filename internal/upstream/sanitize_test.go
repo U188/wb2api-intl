@@ -349,7 +349,7 @@ func TestChatStreamWireBodySanitizeDisabled(t *testing.T) {
 	defer ts.Close()
 
 	c := New()
-	c.SanitizeFingerprints = false
+	c.SetSanitizeFingerprints(false)
 	c.ChatBaseCN = ts.URL
 	acct := &auth.Auth{AccessToken: "test-token", Domain: "copilot.tencent.com", UID: "u1"}
 

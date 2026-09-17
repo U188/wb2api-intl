@@ -3,17 +3,14 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
-	"fmt"
 	"io"
 	"io/fs"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
@@ -29,10 +26,17 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.6.3-panel"
+const appVersion = "1.1.0-dual"
 
 func main() {
-	cfgPath := flag.String("config", "config.json", "配置文件路径（默认当前目录 config.json；不存在时自动生成推荐配置）")
+	maybeRunSupervisor()
+	if runService() {
+		os.Exit(restartExitCode)
+	}
+}
+
+func runService() bool {
+	cfgPath := flag.String("config", "config.json", "配置文件路径（不存在时自动生成）")
 	flag.Parse()
 
 	cfg, err := Load(*cfgPath)
@@ -41,8 +45,8 @@ func main() {
 		if errors.Is(err, fs.ErrNotExist) {
 			// 首次运行：目录下没有配置 → 自动落一份推荐配置（含随机 api_key）再加载。
 			// 双击 exe / 裸跑 docker 即开，无需先手工复制样例。
-			if key, werr := WriteDefault(*cfgPath); werr == nil {
-				log.Printf("config %s 不存在，已生成推荐配置（api_key=%s，记录在该文件里，可自行修改）", *cfgPath, key)
+			if _, werr := WriteDefault(*cfgPath); werr == nil {
+				log.Printf("config %s 不存在，已生成推荐配置；API 密钥请从该文件读取", *cfgPath)
 				cfg, err = Load(*cfgPath)
 			}
 			if err != nil {
@@ -114,7 +118,7 @@ func main() {
 	}
 	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
-	up.SanitizeFingerprints = cfg.Features.SanitizeBlacklistFingerprints
+	up.SetSanitizeFingerprints(cfg.Features.SanitizeBlacklistFingerprints)
 	// 出站 UA 与归属头（issue #42 + 上游同步）：
 	// UserAgent 非空则完全覆盖；ClientVersion/CliVersion 缺省对齐官方形态；
 	// ClientName 非空时 chat 路径注入 X-IDE-* 四头（用量归因对齐官方桌面端）。
@@ -185,8 +189,10 @@ func main() {
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		Default1MContext:     cfg.Features.Default1MContext,
 	})
-	restartRequests := make(chan struct{}, 1)
-	var controlMu sync.Mutex
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	restartControl := newRestartController(*cfgPath, stop)
+	runtimeMgr := newRuntimeConfigManager(*cfgPath, cfg, live, p, up, sch)
 	pn := panel.New(panel.Config{
 		Pool:             p,
 		Upstream:         up,
@@ -200,28 +206,9 @@ func main() {
 		Default1MContext: cfg.Features.Default1MContext,
 		ConfigPath:       *cfgPath,
 		LoadConfig:       func() (any, error) { return Load(*cfgPath) },
-		SaveConfig:       func(raw []byte) ([]string, error) { return saveConfig(raw, *cfgPath, live, p, up, sch) },
-		ReloadConfig: func() ([]string, error) {
-			newCfg, err := Load(*cfgPath)
-			if err != nil {
-				return nil, err
-			}
-			applyRuntimeConfig(newCfg, live, p, up, sch)
-			return restartRequiredFields(newCfg), nil
-		},
-		Restart: func() error {
-			controlMu.Lock()
-			defer controlMu.Unlock()
-			if _, err := Load(*cfgPath); err != nil {
-				return fmt.Errorf("restart preflight: %w", err)
-			}
-			select {
-			case restartRequests <- struct{}{}:
-				return nil
-			default:
-				return errors.New("restart already pending")
-			}
-		},
+		SaveConfig:       runtimeMgr.Save,
+		ReloadConfig:     runtimeMgr.Reload,
+		Restart:          restartControl.Request,
 	})
 	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
@@ -242,18 +229,7 @@ func main() {
 		MaxBodyBytes:     int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
 	})
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	go func() {
-		select {
-		case <-restartRequests:
-			// 留出响应发送时间；由 Docker/服务管理器监督拉起，不在进程内 fork。
-			time.Sleep(300 * time.Millisecond)
-			log.Printf("panel: restart accepted; graceful shutdown for supervisor restart")
-			stop()
-		case <-ctx.Done():
-		}
-	}()
 	go sch.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 
@@ -262,19 +238,24 @@ func main() {
 		Handler:           h,
 		ReadHeaderTimeout: 30 * time.Second,
 	}
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
-		p.Flush() // 信号触发：先落盘再做优雅停机
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+		_ = shutdownHTTP(srv)
+		p.Flush()
 	}()
 
 	log.Printf("workbuddy2api listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		stop()
+		<-shutdownDone
 		log.Fatalf("http: %v", err)
 	}
+	stop()
+	<-shutdownDone
 	log.Printf("bye")
+	return restartControl.Pending()
 }
 
 // panelListenPath 从 listen 地址提取 ":port" 形式，用于启动日志拼面板 URL
@@ -302,117 +283,5 @@ func panelListenPath(listen string) string {
 // 面板表单覆盖到的键），避免把用户手写的注释性字段/未知键洗掉——这里直接整体
 // 序列化校验后的配置，未知键在 json.Unmarshal 时已丢失，故先合并原始 map。
 func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) ([]string, error) {
-	// 1) 解析原始 JSON 为 map（保留用户手写的未知键），再叠加面板提交的键。
-	oldRaw, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read current config: %w", err)
-	}
-	var cur, incoming map[string]any
-	if err := json.Unmarshal(oldRaw, &cur); err != nil {
-		cur = map[string]any{}
-	}
-	if err := json.Unmarshal(raw, &incoming); err != nil {
-		return nil, fmt.Errorf("parse submitted config: %w", err)
-	}
-	merged := mergeConfigMaps(cur, incoming)
-
-	// 2) 校验（与启动同一套 Default+normalize），失败直接返回、不落盘。
-	newCfg, err := ParseConfig(mergedJSON(merged))
-	if err != nil {
-		return nil, err
-	}
-
-	// 3) 落盘（原子替换）。
-	out, err := json.MarshalIndent(merged, "", "  ")
-	if err != nil {
-		return nil, fmt.Errorf("marshal config: %w", err)
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
-		return nil, fmt.Errorf("write config: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return nil, fmt.Errorf("replace config: %w", err)
-	}
-
-	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
-	live.Store(livecfg.Snapshot{
-		APIKey:               newCfg.APIKey,
-		SoftCooldown:         newCfg.SoftRateDur,
-		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
-		Default1MContext:     newCfg.Features.Default1MContext,
-	})
-	up.SanitizeFingerprints = newCfg.Features.SanitizeBlacklistFingerprints
-	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
-	p.SetDegrade(newCfg.Pool.DegradeThreshold, newCfg.DegradeCooldownDur, newCfg.DegradeCooldownMaxD)
-	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
-	p.SetSoftRateMax(newCfg.SoftRateMaxDur)
-	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
-	sch.Reconfigure(
-		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,
-		newCfg.Schedule.ActivityHours, newCfg.Schedule.KeepaliveHours, newCfg.Schedule.BlackcatHours,
-		!newCfg.Schedule.CheckinEnabled, !newCfg.Schedule.TravelEnabled,
-		!newCfg.Schedule.ActivityEnabled, !newCfg.Schedule.KeepaliveEnabled, !newCfg.Schedule.BlackcatEnabled)
-	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
-
-	return restartRequiredFields(newCfg), nil
-}
-
-// restartRequiredFields 返回本次改动中无法热生效、需要重启进程的字段名。
-// 恒返回完整清单中的"与当前进程装配期依赖相关"的项——面板据此提示用户。
-func restartRequiredFields(c *Config) []string {
-	var out []string
-	// 这些字段在进程内被监听地址/HTTP client/目录句柄等装配期对象捕获。
-	if c.Listen != "" {
-		out = append(out, "listen")
-	}
-	if c.AuthDir != "" {
-		out = append(out, "auth_dir")
-	}
-	if c.StateFile != "" {
-		out = append(out, "state_file")
-	}
-	out = append(out, "upstream.timeout_seconds", "upstream.header_timeout_seconds", "upstream.idle_timeout_seconds")
-	if c.Upstash.URL != "" || c.Upstash.Token != "" {
-		out = append(out, "upstash")
-	}
-	out = append(out, "session_sticky.ttl", "session_sticky.gc_interval")
-	return out
-}
-
-// mergeConfigMaps 把 incoming 深合并进 cur（原地），返回 cur。
-// 对嵌套对象逐键覆盖而不是整体替换：面板表单只提交它管理的键，
-// 未提交的兄弟键（含用户手写的未知键）保持原样。
-func mergeConfigMaps(cur, incoming map[string]any) map[string]any {
-	for k, v := range incoming {
-		if inMap, ok := v.(map[string]any); ok {
-			if curMap, ok := cur[k].(map[string]any); ok {
-				cur[k] = mergeConfigMaps(curMap, inMap)
-				continue
-			}
-		}
-		cur[k] = v
-	}
-	return cur
-}
-
-// mergedJSON 把合并后的 map 序列化回 JSON（供 ParseConfig 校验）。
-func mergedJSON(m map[string]any) []byte {
-	b, err := json.Marshal(m)
-	if err != nil {
-		return []byte("{}")
-	}
-	return b
-}
-
-func applyRuntimeConfig(c *Config, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) {
-	live.Store(livecfg.Snapshot{APIKey: c.APIKey, SoftCooldown: c.SoftRateDur, SanitizeFingerprints: c.Features.SanitizeBlacklistFingerprints, Default1MContext: c.Features.Default1MContext})
-	up.SanitizeFingerprints = c.Features.SanitizeBlacklistFingerprints
-	p.SetBreaker(c.Pool.BreakerThreshold, c.BreakerCooldownDur, c.BreakerCooldownMaxD)
-	p.SetDegrade(c.Pool.DegradeThreshold, c.DegradeCooldownDur, c.DegradeCooldownMaxD)
-	p.SetMaxInFlight(c.Pool.MaxInFlight)
-	p.SetSoftRateMax(c.SoftRateMaxDur)
-	p.SetWeights(c.Pool.IdleWeightPerHour, c.Pool.IdleWeightMax)
-	sch.Reconfigure(c.Schedule.CheckinHours, c.Schedule.TravelHours, c.Schedule.ActivityHours, c.Schedule.KeepaliveHours, c.Schedule.BlackcatHours, !c.Schedule.CheckinEnabled, !c.Schedule.TravelEnabled, !c.Schedule.ActivityEnabled, !c.Schedule.KeepaliveEnabled, !c.Schedule.BlackcatEnabled)
-	sch.SetBalanceInterval(c.BalanceRefreshInterval)
+	return saveConfigCompat(raw, path, live, p, up, sch)
 }

@@ -403,9 +403,9 @@ function collectConfig() {
     else if (el.type === 'number') { v = el.value.trim() === '' ? undefined : Number(el.value); }
     else {
       const raw = el.value.trim();
-      if (raw === '') v = undefined;
-      else if (name.endsWith('_hours')) v = raw.split(/[,，\s]+/).filter(Boolean).map(Number);
-      else v = raw;
+      if (name.endsWith('_hours')) v = raw === '' ? [] : raw.split(/[,，\s]+/).filter(Boolean).map(Number);
+      else if (raw === '' && ['api_key', 'listen', 'user_agent', 'prompt_file'].includes(name)) v = '';
+      else v = raw === '' ? undefined : raw;
     }
     if (v !== undefined) put(out, path, v);
   }
@@ -423,31 +423,61 @@ $('btnCfgReload').onclick = async () => {
   btn.disabled = true; btn.textContent = '重载中…';
   try {
     const r = await api('config/reload', { method: 'POST' });
-    const n = (r.restart_required || []).length;
-    toast(n ? '已从磁盘热重载；仍有 ' + n + ' 项需重启' : '已从磁盘热重载并立即生效', 'ok');
+    updateSessionKey(r);
+    const fields = r.restart_required || [];
     await loadConfig();
+    $('cfgNote').textContent = fields.length ? '待重启：' + fields.join('、') : '配置已热生效';
+    toast(fields.length ? '已热重载；部分启动项待重启' : '已从磁盘热重载并立即生效', 'ok');
   } catch (e) { toast('热重载失败：' + e.message, 'err'); }
   finally { btn.disabled = false; btn.textContent = '从磁盘热重载'; }
 };
+function updateSessionKey(r, fallback) {
+  const k = typeof r.api_key === 'string' ? r.api_key : fallback;
+  if (typeof k !== 'string') return;
+  if (k) localStorage.setItem(LS_KEY, k); else localStorage.removeItem(LS_KEY);
+}
 $('btnRestart').onclick = async () => {
-  if (!confirm('服务将优雅退出。Docker/服务管理器需配置自动拉起；确定继续？')) return;
+  if (!confirm('确定重启服务？已保存配置将重新加载，正在进行的请求最多等待 5 秒后断开。')) return;
+  const btn = $('btnRestart');
+  btn.disabled = true; btn.textContent = '重启中…';
   try {
+    const before = await api('overview');
     await api('restart', { method: 'POST' });
-    toast('已接受重启请求，等待服务恢复…', 'ok');
-  } catch (e) { toast('重启失败：' + e.message, 'err'); }
+    $('cfgNote').textContent = '重启已接受，正在等待服务恢复…';
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    let restored = false;
+    for (let i = 0; i < 30; i++) {
+      try {
+        const h = {}; const k = localStorage.getItem(LS_KEY);
+        if (k) h.Authorization = 'Bearer ' + k;
+        const resp = await fetch('/panel/api/overview', { headers: h, cache: 'no-store', signal: AbortSignal.timeout(1500) });
+        if (resp.status === 401) { openKey(); throw new Error('服务已恢复，请输入重新加载后的 API 密钥'); }
+        if (resp.ok) {
+          const d = await resp.json();
+          if (d.started_at && d.started_at !== before.started_at) { restored = true; break; }
+        }
+      } catch (e) { if (e.message.includes('API 密钥')) throw e; }
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    if (!restored) throw new Error('恢复等待超时；若修改了监听端口，请访问新地址');
+    await loadConfig(); await loadOverview(true);
+    $('cfgNote').textContent = '服务已重启，配置已重新加载';
+    toast('服务已恢复', 'ok');
+  } catch (e) { $('cfgNote').textContent = e.message; toast('重启状态：' + e.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = '重启服务'; }
 };
 $('cfgForm').onsubmit = async ev => {
   ev.preventDefault();
   const btn = $('btnCfgSave');
   btn.disabled = true; btn.textContent = '保存中…';
   try {
-    const r = await api('config', { method: 'POST', body: JSON.stringify(collectConfig()) });
-    const n = (r.restart_required || []).length;
-    toast(n ? '配置已保存，其中 ' + n + ' 项需重启进程生效' : '配置已保存并立即生效', 'ok');
-    // 密钥可能已改：本次会话沿用新值，避免下一次轮询被 401。
-    const k = $('cfgKey').value.trim();
-    if (k) localStorage.setItem(LS_KEY, k);
-    loadConfig();
+    const submitted = collectConfig();
+    const r = await api('config', { method: 'POST', body: JSON.stringify(submitted) });
+    updateSessionKey(r, submitted.api_key);
+    const fields = r.restart_required || [];
+    await loadConfig();
+    $('cfgNote').textContent = fields.length ? '待重启：' + fields.join('、') : '配置已热生效';
+    toast(fields.length ? '已保存；部分启动项待重启' : '配置已保存并立即生效', 'ok');
     loadOverview(true);
   } catch (e) { toast('保存失败：' + e.message, 'err'); }
   finally { btn.disabled = false; btn.textContent = '保存配置'; }

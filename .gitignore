@@ -35,6 +35,7 @@ docs/
 *.md
 !README.md
 !internal/prompt/defaultprompt.md
+!CHANGELOG.md
 
 # Windows binaries
 /wb2api.exe
