@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.1.1 — 2026-09-18
+
+元数据修正补丁，不改任何请求链路与站点隔离行为：
+
+- 国际站 `deepseek-v4.1-flash` 的 `max_output_tokens` 由 50000 修正为 384000（DeepSeek 官方 models.dev 目录值，亦为 28 家 provider 共识档）。
+- 澄清两处同名不同部署的常量边界：CN 动态目录 `normalizeContextWindow` 的 50000 兜底保持不变（与腾讯官方 `product.internal.json` 对 `deepseek-v4-flash` 的声明一致），Intl 目录不经过该函数，两侧禁止互相套用。
+- `max_output_tokens` 仅用于 `/v1/models` 与面板展示；网关从不在出站请求注入或钳制 `max_tokens`（唯一写入点是 `translateMaxCompletionTokens`，只搬运客户端显式给出的 `max_completion_tokens`，且显式 `max_tokens` 优先），因此该修正只影响读取此字段做自我裁剪的客户端。
+
+### 验证
+
+- `go build ./...` / `go vet ./...` / `go test ./...` / `go test -race ./...` 全通过。
+
 ## v1.1.0 — 2026-09-17
 
 双通道增强版，继续保持路径级站点隔离：

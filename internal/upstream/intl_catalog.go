@@ -19,7 +19,11 @@ var intlBuiltinModels = []ModelInfo{
 	intlModel("gpt-5.4", "GPT-5.4", 272_000, 128_000, 0, "x1.65 credits", nil, "high", false, true),
 	intlModel("gpt-5.3-codex", "GPT-5.3-Codex", 272_000, 128_000, 0, "x1.25 credits", nil, "high", false, true),
 	intlModel("gemini-3.5-flash", "Gemini-3.5-Flash", 1_000_000, 65_536, 1_000_000, "x0.99 credits", nil, "medium", false, true),
-	intlModel("deepseek-v4.1-flash", "DeepSeek-V4.1-Flash", 1_000_000, 50_000, 1_000_000, "x0.06 credits", nil, "high", false, true),
+	// DeepSeek 官方目录对 V4.1 Flash 标注输出上限 384K（models.dev 上 deepseek
+	// 官方 provider 值，且 384000 是 28 家 provider 的共识档）。腾讯 CLI
+	// product.json 的 50K 只属于 CN 侧 deepseek-v4-flash，两者不是同一部署，
+	// 禁止互相套用；该字段仅用于 /v1/models 与面板展示，不参与出站改写。
+	intlModel("deepseek-v4.1-flash", "DeepSeek-V4.1-Flash", 1_000_000, 384_000, 1_000_000, "x0.06 credits", nil, "high", false, true),
 	intlModel("glm-5.3", "GLM-5.3", 1_000_000, 48_000, 1_000_000, "x0.79 credits", []string{"low", "high", "max"}, "high", true, true),
 	intlModel("glm-5.2", "GLM-5.2", 1_000_000, 48_000, 1_000_000, "x0.79 credits", []string{"high", "xhigh"}, "high", true, true),
 	intlModel("kimi-k3", "Kimi-K3", 1_000_000, 32_000, 1_000_000, "x1.62 credits", nil, "medium", false, true),

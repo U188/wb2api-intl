@@ -96,7 +96,7 @@ func TestSiteModelsFallbackDoesNotUseOtherSiteAccount(t *testing.T) {
 		}
 		if m["id"] == "deepseek-v4.1-flash" {
 			foundV41Flash = true
-			if m["max_input_tokens"] != float64(1_000_000) || m["max_output_tokens"] != float64(50_000) {
+			if m["max_input_tokens"] != float64(1_000_000) || m["max_output_tokens"] != float64(384_000) {
 				t.Fatalf("deepseek-v4.1-flash limits=%v", m)
 			}
 			contextWindow, ok := m["contextWindow"].(map[string]any)

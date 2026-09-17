@@ -680,7 +680,7 @@ func parseContextWindow(lengths []json.RawMessage, defaultRaw json.RawMessage) (
 func normalizeContextWindow(id string, maxInput, maxOutput, maxAllowed int64, lengths []int64, defaultLength int64) (int64, int64, int64, []int64, int64) {
 	isDeepSeekV4 := deepSeekV4ContextModel.MatchString(id)
 	if isDeepSeekV4 {
-		// 官方目录给 V4/V4.1 标注 1M/50K；仅在动态接口缺失时补齐。
+		// 官方 CN 目录给 V4/V4.1 标注 1M/50K；仅在动态接口缺失时补齐。
 		// 若某个租户/私有变体明确返回更小上限，必须尊重该部署，禁止虚报 1M。
 		if maxInput <= 0 {
 			maxInput = 1_000_000
@@ -688,6 +688,9 @@ func normalizeContextWindow(id string, maxInput, maxOutput, maxAllowed int64, le
 		if maxAllowed <= 0 {
 			maxAllowed = maxInput
 		}
+		// 50K 是 CN 侧腾讯官方 product.json 对 deepseek-v4-flash 的声明值，
+		// 只在本函数（CN 动态目录）兜底。Intl 目录不经过此处，其 V4.1 Flash
+		// 输出上限见 intl_catalog.go（384K，DeepSeek 官方/models.dev 共识）。
 		if maxOutput <= 0 {
 			maxOutput = 50_000
 		}

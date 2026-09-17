@@ -29,7 +29,7 @@ func TestIntlBuiltinModelsOfficialCLIContract(t *testing.T) {
 		"gpt-5.4":             {272000, 128000, 0, "x1.65 credits", nil, "high", false, true},
 		"gpt-5.3-codex":       {272000, 128000, 0, "x1.25 credits", nil, "high", false, true},
 		"gemini-3.5-flash":    {1000000, 65536, 1000000, "x0.99 credits", nil, "medium", false, true},
-		"deepseek-v4.1-flash": {1000000, 50000, 1000000, "x0.06 credits", nil, "high", false, true},
+		"deepseek-v4.1-flash": {1000000, 384000, 1000000, "x0.06 credits", nil, "high", false, true},
 		"glm-5.3":             {1000000, 48000, 1000000, "x0.79 credits", []string{"low", "high", "max"}, "high", true, true},
 		"glm-5.2":             {1000000, 48000, 1000000, "x0.79 credits", []string{"high", "xhigh"}, "high", true, true},
 		"kimi-k3":             {1000000, 32000, 1000000, "x1.62 credits", nil, "medium", false, true},
