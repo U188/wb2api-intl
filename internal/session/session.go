@@ -70,7 +70,14 @@ func (r *Router) StartGC() {
 		r.mu.Unlock()
 		return
 	}
-	r.stop = make(chan struct{})
+	// stop channel 必须在启 goroutine 前捕获到**局部变量**：goroutine 在 select 里
+	// 每轮重新求值 r.stop 是无锁读，而 StopGC 持写锁把它置 nil——既是数据竞争
+	// （-race 可复现），又会在读到 nil 后让该 case 永久阻塞（nil channel 永不就绪），
+	// 于是关停彻底失效：goroutine 再也不会退出，ticker 无限触发 gcOnce（goroutine
+	// 泄漏 + 关停后仍持续 GC）。捕获局部变量后，close(stop) 与 select 观测的是同一个
+	// channel，StopGC 一定能让 goroutine 退出。
+	stop := make(chan struct{})
+	r.stop = stop
 	r.mu.Unlock()
 
 	go func() {
@@ -78,7 +85,7 @@ func (r *Router) StartGC() {
 		defer t.Stop()
 		for {
 			select {
-			case <-r.stop:
+			case <-stop:
 				return
 			case <-t.C:
 				r.gcOnce(time.Now())

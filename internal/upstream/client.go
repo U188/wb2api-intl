@@ -147,11 +147,20 @@ func SoftRateResetLoc() *time.Location { return softRateResetLoc }
 // 而不是账号整体被限流——账号健康，只是这个模型此刻被限（issue #31）。
 const modelRateLimitCode = "6004"
 
-// softRateResetRe 匹配「将在 … 重置」，捕获中间的时间串。
-const softRateResetRe = `将在 (.+?) 重置`
+// softRateResetReCN 匹配中文「将在 … 重置」，捕获中间的时间串。
+const softRateResetReCN = `将在 (.+?) 重置`
+
+// softRateResetReEN 匹配英文「reset at <时间>」形态（global 域文案，大小写不敏感）。
+// 只捕获完整时间戳，避免把自然语言（如 "reset at the end of the day"）误当时间。
+const softRateResetReEN = `(?i)reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})`
 
 // softRateTimeLayout 上游重置时间的格式（无时区后缀；时区固定 UTC+8）。
 const softRateTimeLayout = "2006-01-02 15:04:05"
+
+var (
+	reSoftRateResetCN = regexp.MustCompile(softRateResetReCN)
+	reSoftRateResetEN = regexp.MustCompile(softRateResetReEN)
+)
 
 // IsModelRateLimit 报告 429 body 是否明确指向模型级限流（业务 code 6004）。
 // 用于区分"账号级软限流"（按账号冷却）与"模型级用量限流"（切模型即可用）。
@@ -169,8 +178,10 @@ func ParseSoftRateReset(body string) (time.Time, bool) {
 	if !IsModelRateLimit(body) {
 		return time.Time{}, false
 	}
-	re := regexp.MustCompile(softRateResetRe)
-	m := re.FindStringSubmatch(body)
+	m := reSoftRateResetCN.FindStringSubmatch(body)
+	if len(m) < 2 {
+		m = reSoftRateResetEN.FindStringSubmatch(body)
+	}
 	if len(m) < 2 {
 		return time.Time{}, false
 	}
@@ -406,6 +417,15 @@ func (c *Client) prepareBodySnapshot(s auth.Snapshot, body []byte) []byte {
 	return PrepareBodyOptWithEfforts(body, c.sanitizeEnabled(), c.effortsSnapshot(s.Site))
 }
 
+// prepareBodySnapshotCacheKey 在 prepareBodySnapshot 基础上注入上游 prompt_cache_key
+// （见 cache_key.go）：同一客户端对同一账号的连续请求复用上游前缀缓存，实测前缀
+// 命中后费用降约 17×。按账号隔离（uid 段），跨账号缓存键绝不碰撞。
+// conversationID 为网关解析出的会话标识；body 已显式带 prompt_cache_key 时原样保留。
+func (c *Client) prepareBodySnapshotCacheKey(s auth.Snapshot, body []byte, conversationID string) []byte {
+	out := c.prepareBodySnapshot(s, body)
+	return InjectPromptCacheKey(out, s.UID, conversationID)
+}
+
 // effortsSnapshot 返回指定站点 effort 能力缓存副本。国际目录是随程序内置的，
 // 即使进程启动后尚未访问 models 接口，聊天也必须立刻按官方能力校正档位。
 func (c *Client) effortsSnapshot(site string) map[string][]string {
@@ -590,14 +610,25 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string) (io.Read
 }
 
 // ChatStreamContext binds the upstream stream to the caller's lifetime.
-func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byte, clientIP string) (rc io.ReadCloser, status int, respBody []byte, err error) {
+func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byte, clientIP string) (io.ReadCloser, int, []byte, error) {
+	return c.chatStreamContext(ctx, a, body, clientIP, "")
+}
+
+// ChatStreamContextWithConversation 同 ChatStreamContext，但额外携带网关解析出的
+// 会话标识，用于出站注入 prompt_cache_key（见 cache_key.go，实测省费约 17×）。
+// 旧签名委托至此（conversationID 空），既有调用方与测试无需改动。
+func (c *Client) ChatStreamContextWithConversation(ctx context.Context, a *auth.Auth, body []byte, clientIP, conversationID string) (io.ReadCloser, int, []byte, error) {
+	return c.chatStreamContext(ctx, a, body, clientIP, conversationID)
+}
+
+func (c *Client) chatStreamContext(ctx context.Context, a *auth.Auth, body []byte, clientIP, conversationID string) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	s := a.Snapshot()
 	urlBase := c.ChatBaseCN
 	if auth.SiteFrom(s.Site) == auth.SiteIntl && c.ChatBaseIntl != "" {
 		urlBase = c.ChatBaseIntl
 	}
 	url := urlBase + "/v2/chat/completions"
-	out := c.prepareBodySnapshot(s, body)
+	out := c.prepareBodySnapshotCacheKey(s, body, conversationID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(out))
 	if err != nil {
 		return nil, 0, nil, err

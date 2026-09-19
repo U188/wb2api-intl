@@ -61,10 +61,10 @@ func TestBackfillReasoningContentDeepSeek(t *testing.T) {
 				{"role":"user","content":"u2"},
 				{"role":"assistant","content":"a2"}]}`,
 			2, []string{"t1", ""}},
-		{"assistant reasoning 为空串视为无 reasoning 痕迹",
+		{"assistant reasoning 为空串：enabled 门下补空串 reasoning_content（不再视为无痕迹）",
 			`{"model":"deepseek-v4-flash","messages":[
 				{"role":"assistant","content":"a","reasoning":""}]}`,
-			1, []string{"<absent>"}},
+			1, []string{""}},
 		{"多 assistant 都带 reasoning 全部复制",
 			`{"model":"deepseek-v4-flash","messages":[
 				{"role":"assistant","content":"a1","reasoning":"r1"},
@@ -73,7 +73,7 @@ func TestBackfillReasoningContentDeepSeek(t *testing.T) {
 		{"reasoning 非 string 值（数字）按空串处理",
 			`{"model":"deepseek-v4-flash","messages":[
 				{"role":"assistant","content":"a","reasoning":123}]}`,
-			1, []string{"<absent>"}},
+			1, []string{""}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -94,15 +94,17 @@ func TestBackfillReasoningContentDeepSeek(t *testing.T) {
 	}
 }
 
-// TestBackfillReasoningContentNoTrace 会话无任何 reasoning 痕迹 → 零改动：
-// 不白白给 assistant 消息加 reasoning_content 字段。
+// TestBackfillReasoningContentNoTrace 无 reasoning 痕迹时的门控：
+// 对齐官方 ReasoningContentBackfillRule（thinkingEnabled || hasTrace）——
+// deepseek + disabled + 零痕迹 → 不动（官方 thinkingEnabled=false 且 ec=false）；
+// deepseek + enabled（含默认注入）→ 照补（见 TestBackfillReasoningFieldNonEmpty）。
 func TestBackfillReasoningContentNoTrace(t *testing.T) {
 	cases := []struct {
 		name string
 		body string
 	}{
-		{"纯 text assistant 不动",
-			`{"model":"deepseek-v4-flash","messages":[
+		{"disabled 纯 text assistant 不动",
+			`{"model":"deepseek-v4-flash","thinking":{"type":"disabled"},"messages":[
 				{"role":"user","content":"u"},
 				{"role":"assistant","content":"plain answer"}]}`},
 		{"无 assistant 消息不动",

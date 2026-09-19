@@ -26,7 +26,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.1.1-dual"
+const appVersion = "1.2.0-dual"
 
 func main() {
 	maybeRunSupervisor()

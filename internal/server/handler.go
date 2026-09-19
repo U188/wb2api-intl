@@ -399,11 +399,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, site s
 
 	// 会话键按站点命名空间化，解析与重分配都使用站点感知候选集。
 	sessKey := ""
+	// rawSessKey 供上游 prompt_cache_key 注入（不受会话粘性开关影响，纯省费优化）；
+	// sessKey 是加站点前缀后的粘性路由键。
+	rawSessKey := session.ExtractKey(body)
 	stickyUID := ""
 	if h.cfg.Session != nil {
-		rawKey := session.ExtractKey(body)
-		if rawKey != "" {
-			sessKey = site + ":" + rawKey
+		if rawSessKey != "" {
+			sessKey = site + ":" + rawSessKey
 			if uid, ok := h.cfg.Session.ResolveForSiteModel(sessKey, site, peek.Model); ok {
 				stickyUID = uid
 			}
@@ -527,7 +529,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, site s
 
 		// 客户端 IP 按请求传递（PassthroughIP 开启时注入；消除共享字段竞态）。
 		attemptStarted := time.Now()
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body, clientIP)
+		// 会话标识随请求传入，供上游注入 prompt_cache_key（前缀缓存复用，省费）；
+		// rawSessKey 为 session.ExtractKey 的原始返回值（未加站点前缀），空则不复用。
+		rc, status, respBody, terr := h.cfg.Upstream.ChatStreamContextWithConversation(r.Context(), acct, body, clientIP, rawSessKey)
 		if terr != nil {
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
 			// 上游 client 已打 transport error 日志。
